@@ -3,6 +3,7 @@ from typing import Optional
 
 import bcrypt
 from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi.responses import RedirectResponse
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import JWTError, jwt
 from pydantic import BaseModel, EmailStr
@@ -146,7 +147,8 @@ async def kite_callback(
     # We assume the first user for simplicity in this single-tenant deployment
     config = db.query(TradingConfiguration).first()
     if not config or not config.broker_api_key or not config.broker_api_secret:
-        raise HTTPException(status_code=400, detail="Broker API details not found in config")
+        # Redirect with error
+        return RedirectResponse(url="/config?auth=error&reason=config_missing")
 
     try:
         from services.broker_connector import ZerodhaBroker
@@ -161,12 +163,10 @@ async def kite_callback(
         config.updated_at = datetime.utcnow()
         db.commit()
         
-        return {
-            "success": True,
-            "message": "Zerodha session authenticated and token saved! You can now start the bot."
-        }
+        # Redirect back to config page with success param
+        return RedirectResponse(url="/config?auth=success")
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        return RedirectResponse(url=f"/config?auth=error&reason={str(e)}")
 
 
 @router.post("/kite/postback")
