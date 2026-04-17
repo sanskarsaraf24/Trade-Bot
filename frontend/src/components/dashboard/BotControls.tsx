@@ -32,69 +32,79 @@ export default function BotControls({ onAction }: { onAction: () => void }) {
 
   return (
     <div className="flex flex-col items-end gap-2">
-      <div className="flex items-center gap-2">
+      <div className="flex items-center gap-3">
         {/* Broker indicator */}
         {brokerType && (
-          <span className="text-[10px] text-slate-500 flex items-center gap-1">
+          <div className="flex items-center gap-1.5 px-2 py-1 bg-slate-100 rounded-lg">
             {brokerType === 'paper' ? (
-              <><WifiOff className="w-3 h-3 text-yellow-500" /> Paper</>
+              <><WifiOff className="w-3 h-3 text-amber-500" /><span className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Simulator</span></>
             ) : (
-              <><Wifi className="w-3 h-3 text-green-500" /> {brokerType}</>
+              <><Wifi className="w-3 h-3 text-emerald-500" /><span className="text-[10px] font-bold text-slate-600 uppercase tracking-widest">Live: {brokerType}</span></>
             )}
-          </span>
+          </div>
         )}
 
         {/* Status badge */}
-        <span className={clsx(
-          'chip text-[10px]',
-          isRunning ? 'chip-profit' : isPaused ? 'chip-brand' : 'bg-slate-800 text-slate-400'
+        <div className={clsx(
+          'flex items-center gap-2 px-3 py-1.5 rounded-full border shadow-sm',
+          isRunning ? 'bg-emerald-50 border-emerald-100 text-emerald-700' 
+            : isPaused ? 'bg-indigo-50 border-indigo-100 text-indigo-700' 
+            : 'bg-slate-50 border-slate-200 text-slate-500'
         )}>
           <span className={clsx(
-            'status-dot',
-            isRunning ? 'bg-profit blink' : isPaused ? 'bg-brand-400 blink' : 'bg-slate-600'
+            'w-2 h-2 rounded-full',
+            isRunning ? 'bg-emerald-500 blink' : isPaused ? 'bg-indigo-500 blink' : 'bg-slate-300'
           )} />
-          {isRunning ? 'Running' : isPaused ? 'Paused' : isStopped ? 'Stopped' : status}
-        </span>
+          <span className="text-[11px] font-bold uppercase tracking-wider">
+               {isRunning ? 'System Active' : isPaused ? 'System Paused' : isStopped ? 'System Standby' : status}
+          </span>
+        </div>
 
-        {isStopped && (
-          <button id="btn-start-bot" onClick={() => run(botApi.start)} disabled={loading}
-            className="btn-success disabled:opacity-50">
-            {loading ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
-            Start Bot
-          </button>
-        )}
+        <div className="h-4 w-px bg-slate-200 mx-1" />
 
-        {isRunning && (
-          <button id="btn-pause-bot" onClick={() => run(botApi.pause)} disabled={loading}
-            className="btn-ghost disabled:opacity-50">
-            <Pause className="w-4 h-4" /> Pause
-          </button>
-        )}
+        <div className="flex items-center gap-2">
+            {isStopped && (
+            <button id="btn-start-bot" onClick={() => run(botApi.start)} disabled={loading}
+                className="btn-primary">
+                {loading ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
+                <span className="ml-1 tracking-widest uppercase text-[11px] font-bold">Start Engine</span>
+            </button>
+            )}
 
-        {isPaused && (
-          <button id="btn-resume-bot" onClick={() => run(botApi.resume)} disabled={loading}
-            className="btn-primary disabled:opacity-50">
-            <Play className="w-4 h-4" /> Resume
-          </button>
-        )}
+            {isRunning && (
+            <button id="btn-pause-bot" onClick={() => run(botApi.pause)} disabled={loading}
+                className="btn-ghost">
+                <Pause className="w-4 h-4" /> <span className="ml-1 tracking-widest uppercase text-[11px] font-bold">Pause</span>
+            </button>
+            )}
 
-        {(isRunning || isPaused) && (
-          <button id="btn-stop-bot" disabled={loading}
-            onClick={() => { if (confirm('Stop bot and close all positions?')) run(botApi.stop) }}
-            className="btn-danger disabled:opacity-50">
-            <Square className="w-4 h-4" /> Stop
-          </button>
-        )}
+            {isPaused && (
+            <button id="btn-resume-bot" onClick={() => run(botApi.resume)} disabled={loading}
+                className="btn-primary">
+                <Play className="w-4 h-4" /> <span className="ml-1 tracking-widest uppercase text-[11px] font-bold">Resume</span>
+            </button>
+            )}
 
-        <button id="btn-refresh" onClick={() => { onAction() }} disabled={loading}
-          className="btn-ghost disabled:opacity-50 !px-2" title="Refresh">
-          <RefreshCw className={clsx('w-4 h-4', loading && 'animate-spin')} />
-        </button>
+            {(isRunning || isPaused) && (
+            <button id="btn-stop-bot" disabled={loading}
+                onClick={() => { if (confirm('Emergency Stop: Close all positions?')) run(botApi.stop) }}
+                className="btn-danger">
+                <Square className="w-4 h-4" /> <span className="ml-1 tracking-widest uppercase text-[11px] font-bold">Stop</span>
+            </button>
+            )}
+
+            <button id="btn-refresh" onClick={() => { onAction() }} disabled={loading}
+            className="btn-ghost !px-3 shadow-sm border border-slate-200" title="Manual Refresh">
+            <RefreshCw className={clsx('w-4 h-4 text-slate-400', loading && 'animate-spin')} />
+            </button>
+        </div>
       </div>
 
       {/* Error inline */}
       {error && (
-        <p className="text-xs text-red-400 animate-in fade-in max-w-xs text-right">{error}</p>
+        <div className="animate-in slide-in-from-top-1 fade-in bg-rose-50 border border-rose-100 px-3 py-1.5 rounded-lg">
+           <p className="text-[10px] font-bold text-rose-600 uppercase tracking-widest text-right">{error}</p>
+        </div>
       )}
     </div>
   )

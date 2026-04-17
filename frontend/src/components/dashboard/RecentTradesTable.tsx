@@ -18,14 +18,14 @@ export default function RecentTradesTable({ trades }: { trades: unknown[] }) {
   const typed = trades as Trade[]
 
   if (!typed.length) {
-    return <p className="text-sm text-slate-500 text-center py-8">No closed trades today</p>
+    return <p className="text-[11px] font-bold uppercase tracking-widest text-slate-400 text-center py-10 opacity-50">No trades finalized today</p>
   }
 
   const reasonLabel = (r: string) => ({
-    SL_HIT: 'SL Hit',
-    TARGET_HIT: '✓ Target',
-    MANUAL_EXIT: 'Manual',
-    EOD_CLOSE: 'EOD',
+    SL_HIT: 'Stop Loss',
+    TARGET_HIT: 'Target Hit',
+    MANUAL_EXIT: 'Manual Exit',
+    EOD_CLOSE: 'Market Close',
   }[r] || r)
 
   return (
@@ -33,39 +33,39 @@ export default function RecentTradesTable({ trades }: { trades: unknown[] }) {
       <table className="data-table">
         <thead>
           <tr>
-            <th>Symbol</th>
-            <th>Side</th>
+            <th className="pl-0">Asset</th>
+            <th>Signal</th>
             <th className="text-right">Entry</th>
             <th className="text-right">Exit</th>
-            <th className="text-right">P&amp;L</th>
+            <th className="text-right">Net P&L</th>
             <th>Reason</th>
-            <th className="text-right">Time</th>
+            <th className="text-right pr-0">Timestamp</th>
           </tr>
         </thead>
         <tbody>
           {typed.map((trade) => (
-            <tr key={trade.id} className="animate-fade-in">
-              <td className="font-medium text-white">{trade.symbol}</td>
-              <td>
-                <span className={clsx('chip text-[10px]',
+            <tr key={trade.id} className="animate-in fade-in duration-300">
+              <td className="font-bold text-slate-900 py-4 pl-0">{trade.symbol}</td>
+              <td className="py-4">
+                <span className={clsx('chip',
                   trade.signal.includes('BUY') ? 'chip-profit' : 'chip-loss')}>
-                  {trade.signal}
+                  {trade.signal.replace('_STOCK', '').replace('_', ' ')}
                 </span>
               </td>
-              <td className="text-right font-mono text-sm">₹{trade.entry_price?.toLocaleString()}</td>
-              <td className="text-right font-mono text-sm">₹{trade.exit_price?.toLocaleString()}</td>
-              <td className={clsx('text-right font-mono font-bold text-sm',
-                trade.pnl >= 0 ? 'text-profit' : 'text-loss')}>
+              <td className="text-right font-mono text-xs font-bold text-slate-600 py-4 px-4">₹{trade.entry_price?.toLocaleString()}</td>
+              <td className="text-right font-mono text-xs font-bold text-slate-600 py-4 px-4">₹{trade.exit_price?.toLocaleString()}</td>
+              <td className={clsx('text-right font-mono font-black text-sm py-4 px-4',
+                trade.pnl >= 0 ? 'text-emerald-600' : 'text-rose-600')}>
                 {trade.pnl >= 0 ? '+' : ''}₹{trade.pnl?.toLocaleString()}
               </td>
-              <td>
-                <span className={clsx('chip text-[10px]',
+              <td className="py-4 px-4">
+                <span className={clsx('chip',
                   trade.exit_reason === 'TARGET_HIT' ? 'chip-profit'
                     : trade.exit_reason === 'SL_HIT' ? 'chip-loss' : 'chip-brand')}>
                   {reasonLabel(trade.exit_reason)}
                 </span>
               </td>
-              <td className="text-right text-xs text-slate-400">
+              <td className="text-right text-[10px] font-bold text-slate-400 uppercase tracking-widest py-4 pr-0">
                 {trade.exit_time
                   ? format(new Date(trade.exit_time), 'hh:mm a')
                   : '—'}

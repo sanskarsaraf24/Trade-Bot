@@ -1,10 +1,10 @@
 'use client'
-import { TrendingUp, TrendingDown, Target, Wallet, Award, Activity, Clock, Zap } from 'lucide-react'
+import { TrendingUp, TrendingDown, Target, Wallet, Award, Activity, Clock } from 'lucide-react'
 import { useBotStore } from '@/store/trading'
 import clsx from 'clsx'
 
 interface MetricsBarProps {
-  metrics: Record<string, unknown>
+  metrics: Record<string, any>
 }
 
 function StatCard({
@@ -24,25 +24,29 @@ function StatCard({
 }) {
   return (
     <div className={clsx(
-      'stat-card transition-all duration-300',
-      highlight && 'ring-1 ring-brand-500/30 bg-brand-900/10'
+      'stat-card transition-all duration-300 group hover:-translate-y-1',
+      highlight && 'bg-indigo-50/50 border-indigo-100 ring-1 ring-indigo-100 shadow-indigo-100/50'
     )}>
       <div className="flex items-center justify-between">
         <span className="stat-label">{label}</span>
-        <Icon className={clsx(
-          'w-4 h-4',
-          positive === undefined ? 'text-slate-500'
-            : positive ? 'text-profit' : 'text-loss'
-        )} />
+        <div className={clsx(
+          'p-1.5 rounded-lg transition-colors',
+          positive === undefined ? 'bg-slate-50 text-slate-400'
+            : positive ? 'bg-emerald-50 text-emerald-500' : 'bg-rose-50 text-rose-500'
+        )}>
+          <Icon className="w-3.5 h-3.5" />
+        </div>
       </div>
-      <span className={clsx(
-        'stat-value',
-        positive === undefined ? 'text-white'
-          : positive ? 'text-profit' : 'text-loss'
-      )}>
-        {value}
-      </span>
-      {sub && <span className="text-[10px] text-slate-500">{sub}</span>}
+      <div className="mt-2">
+        <span className={clsx(
+          'stat-value block',
+          positive === undefined ? 'text-slate-900'
+            : positive ? 'text-emerald-600' : 'text-rose-600'
+        )}>
+          {value}
+        </span>
+        {sub && <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest leading-none mt-1 inline-block">{sub}</span>}
+      </div>
     </div>
   )
 }
@@ -69,26 +73,26 @@ export default function MetricsBar({ metrics }: MetricsBarProps) {
     : '—'
 
   return (
-    <div className="grid grid-cols-2 sm:grid-cols-4 xl:grid-cols-8 gap-3">
+    <div className="grid grid-cols-2 sm:grid-cols-4 xl:grid-cols-8 gap-4">
       <StatCard
         label="Today's P&L"
         value={fmt(pnl)}
-        sub={`${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(3)}%`}
+        sub={`${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(3)}% Today`}
         icon={pnl >= 0 ? TrendingUp : TrendingDown}
         positive={pnl >= 0}
         highlight={pnl !== 0}
       />
       <StatCard
-        label="Open"
+        label="Active"
         value={String(openPos)}
-        sub="positions"
+        sub="Positions"
         icon={Activity}
-        positive={openPos > 0 ? undefined : undefined}
+        positive={openPos > 0 ? true : undefined}
       />
       <StatCard
-        label="Trades"
+        label="Total Trades"
         value={String(trades)}
-        sub="today"
+        sub="Sessions"
         icon={Target}
       />
       <StatCard
@@ -101,12 +105,12 @@ export default function MetricsBar({ metrics }: MetricsBarProps) {
       <StatCard
         label="Profit Factor"
         value={pf ? `${pf.toFixed(2)}x` : '—'}
-        sub="gross P / gross L"
+        sub="Gross Performance"
         icon={Wallet}
         positive={pf > 1 ? true : pf > 0 ? false : undefined}
       />
       <StatCard
-        label="Avg Win"
+        label="Avg Profit"
         value={avgWin ? `₹${avgWin.toLocaleString()}` : '—'}
         icon={TrendingUp}
         positive={avgWin > 0 ? true : undefined}
@@ -118,9 +122,9 @@ export default function MetricsBar({ metrics }: MetricsBarProps) {
         positive={false}
       />
       <StatCard
-        label="Bot Uptime"
+        label="Uptime"
         value={uptimeStr}
-        sub={status === 'running' ? 'running' : status}
+        sub={status === 'running' ? 'Active' : 'Standby'}
         icon={Clock}
         positive={status === 'running' ? true : undefined}
       />

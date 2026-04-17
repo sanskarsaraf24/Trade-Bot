@@ -7,7 +7,6 @@ const api = axios.create({
   headers: { 'Content-Type': 'application/json' },
 })
 
-// Attach JWT from localStorage on every request
 api.interceptors.request.use((config) => {
   if (typeof window !== 'undefined') {
     const token = localStorage.getItem('trading_token')
@@ -16,7 +15,6 @@ api.interceptors.request.use((config) => {
   return config
 })
 
-// Redirect to login on 401
 api.interceptors.response.use(
   (res) => res,
   (err) => {
@@ -28,7 +26,6 @@ api.interceptors.response.use(
   }
 )
 
-// ─── Auth ─────────────────────────────────────────────────────
 export const authApi = {
   login: (email: string, password: string) =>
     api.post('/auth/login', new URLSearchParams({ username: email, password }), {
@@ -37,16 +34,16 @@ export const authApi = {
   register: (email: string, password: string) =>
     api.post('/auth/register', { email, password }),
   me: () => api.get('/auth/me'),
+  kiteLogin: () => api.get('/auth/kite/login'),
 }
 
-// ─── Config ────────────────────────────────────────────────────
 export const configApi = {
   get: () => api.get('/config'),
   save: (data: Record<string, unknown>) => api.post('/config', data),
+  update: (data: Record<string, unknown>) => api.post('/config', data),
   reset: () => api.delete('/config'),
 }
 
-// ─── Bot ───────────────────────────────────────────────────────
 export const botApi = {
   start: () => api.post('/bot/start'),
   pause: () => api.post('/bot/pause'),
@@ -55,7 +52,6 @@ export const botApi = {
   status: () => api.get('/bot/status'),
 }
 
-// ─── Trades ────────────────────────────────────────────────────
 export const tradesApi = {
   open: () => api.get('/trades/open'),
   closed: (limit = 30) => api.get(`/trades/closed?limit=${limit}`),
@@ -63,7 +59,6 @@ export const tradesApi = {
   exitAll: () => api.post('/trades/exit-all'),
 }
 
-// ─── Metrics ───────────────────────────────────────────────────
 export const metricsApi = {
   daily: () => api.get('/metrics/daily'),
   weekly: () => api.get('/metrics/weekly'),

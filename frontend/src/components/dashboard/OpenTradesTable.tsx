@@ -1,6 +1,6 @@
 'use client'
 import { tradesApi } from '@/lib/api'
-import { X, TrendingUp, TrendingDown } from 'lucide-react'
+import { X, TrendingUp, TrendingDown, Target, Activity } from 'lucide-react'
 import clsx from 'clsx'
 
 interface Trade {
@@ -34,16 +34,16 @@ function ProgressBar({ entry, current, sl, target, signal }: {
   const isProfit = isBuy ? current > entry : current < entry
 
   return (
-    <div className="mt-1.5">
-      <div className="flex justify-between text-[9px] text-slate-600 mb-0.5">
-        <span className="text-red-400">SL ₹{sl?.toLocaleString()}</span>
-        <span className="text-green-400">T ₹{target?.toLocaleString()}</span>
+    <div className="mt-2 group/progress">
+      <div className="flex justify-between text-[8px] font-bold uppercase tracking-widest mb-1 shadow-xs">
+        <span className="text-rose-500 bg-rose-50 px-1 rounded border border-rose-100">SL ₹{sl?.toLocaleString()}</span>
+        <span className="text-emerald-500 bg-emerald-50 px-1 rounded border border-emerald-100">Target ₹{target?.toLocaleString()}</span>
       </div>
-      <div className="h-1 bg-slate-700 rounded-full overflow-hidden">
+      <div className="h-1.5 bg-slate-100 rounded-full overflow-hidden shadow-inner">
         <div
           className={clsx(
-            'h-full rounded-full transition-all duration-500',
-            isProfit ? 'bg-green-500' : 'bg-red-500'
+            'h-full rounded-full transition-all duration-700 ease-out',
+            isProfit ? 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.3)]' : 'bg-rose-500 shadow-[0_0_8px_rgba(244,63,94,0.3)]'
           )}
           style={{ width: `${clampedPct}%` }}
         />
@@ -63,10 +63,9 @@ export default function OpenTradesTable({
 
   if (!typed.length) {
     return (
-      <div className="flex flex-col items-center justify-center py-10 text-slate-600">
-        <TrendingUp className="w-8 h-8 mb-2 opacity-30" />
-        <p className="text-sm">No open positions</p>
-        <p className="text-xs mt-1">The bot will open trades when it finds setups</p>
+      <div className="flex flex-col items-center justify-center py-16 text-slate-400 bg-slate-50/30 rounded-2xl border-2 border-dashed border-slate-100">
+        <Activity className="w-10 h-10 mb-3 opacity-20" />
+        <p className="text-[11px] font-bold uppercase tracking-widest">Market Neutral - No Exposure</p>
       </div>
     )
   }
@@ -90,23 +89,26 @@ export default function OpenTradesTable({
       <table className="data-table">
         <thead>
           <tr>
-            <th>Symbol & Setup</th>
-            <th>Side</th>
+            <th className="pl-0">Asset & Thesis</th>
+            <th>Signal</th>
             <th className="text-right">Entry</th>
-            <th className="text-right">P&amp;L</th>
+            <th className="text-right">Floating P&L</th>
             <th className="text-right">Conf</th>
-            <th className="text-right">Age</th>
-            <th></th>
+            <th className="text-right">Hold</th>
+            <th className="pr-0"></th>
           </tr>
         </thead>
         <tbody>
           {typed.map((trade) => (
-            <tr key={trade.id} className="animate-fade-in align-top">
-              <td className="max-w-[180px]">
-                <span className="font-semibold text-white">{trade.symbol}</span>
-                <p className="text-[10px] text-slate-500 mt-0.5 leading-relaxed line-clamp-2"
+            <tr key={trade.id} className="animate-in fade-in slide-in-from-left-2 duration-300">
+              <td className="max-w-[220px] py-5 pl-0">
+                <div className="flex items-center gap-2 mb-1.5">
+                   <Target className="w-3 h-3 text-indigo-500" />
+                   <span className="font-black text-slate-900 tracking-tight">{trade.symbol}</span>
+                </div>
+                <p className="text-[10px] font-medium text-slate-500 leading-relaxed line-clamp-2 italic"
                    title={trade.claude_reasoning}>
-                  {trade.claude_reasoning || '—'}
+                  "{trade.claude_reasoning || 'No thesis provided'}"
                 </p>
                 <ProgressBar
                   entry={trade.entry_price}
@@ -116,45 +118,43 @@ export default function OpenTradesTable({
                   signal={trade.signal}
                 />
               </td>
-              <td>
-                <span className={clsx('chip text-[10px]',
+              <td className="py-5">
+                <span className={clsx('chip',
                   trade.signal.includes('BUY') ? 'chip-profit' : 'chip-loss')}>
                   {trade.signal.replace('_STOCK', '').replace('_', ' ')}
                 </span>
               </td>
-              <td className="text-right font-mono text-xs">
+              <td className="text-right font-mono text-xs font-bold text-slate-900 py-5 px-4">
                 ₹{trade.entry_price.toLocaleString()}
               </td>
-              <td className={clsx('text-right font-mono font-bold text-sm',
-                trade.pnl >= 0 ? 'text-profit' : 'text-loss')}>
-                <div className="flex items-center justify-end gap-1">
-                  {trade.pnl >= 0
-                    ? <TrendingUp className="w-3 h-3" />
-                    : <TrendingDown className="w-3 h-3" />}
+              <td className={clsx('text-right py-5 px-4')}>
+                <div className={clsx('flex items-center justify-end gap-1.5 font-black text-sm',
+                  trade.pnl >= 0 ? 'text-emerald-600' : 'text-rose-600')}>
                   {trade.pnl >= 0 ? '+' : ''}₹{Math.abs(trade.pnl).toLocaleString()}
                 </div>
-                <div className={clsx('text-[10px] font-normal',
-                  trade.pnl_percent >= 0 ? 'text-green-500' : 'text-red-500')}>
-                  {trade.pnl_percent >= 0 ? '+' : ''}{trade.pnl_percent?.toFixed(2)}%
+                <div className={clsx('text-[10px] font-bold uppercase tracking-widest mt-0.5',
+                  trade.pnl_percent >= 0 ? 'text-emerald-500' : 'text-rose-500')}>
+                  {trade.pnl_percent >= 0 ? '+' : ''}{trade.pnl_percent?.toFixed(2)}% ROI
                 </div>
               </td>
-              <td className="text-right">
-                <span className={clsx('chip text-[10px]',
-                  trade.confidence >= 75 ? 'chip-profit'
-                    : trade.confidence >= 60 ? 'chip-brand' : 'bg-slate-700 text-slate-400')}>
-                  {trade.confidence?.toFixed(0)}%
-                </span>
+              <td className="text-right py-5 px-4">
+                 <div className="flex flex-col items-end gap-1">
+                    <span className="text-[10px] font-black text-slate-900">{trade.confidence?.toFixed(0)}%</span>
+                    <div className="w-10 h-1 bg-slate-100 rounded-full overflow-hidden shadow-inner">
+                        <div className="h-full bg-indigo-500 rounded-full" style={{ width: `${trade.confidence}%` }} />
+                    </div>
+                 </div>
               </td>
-              <td className="text-right text-xs text-slate-400 font-mono">
+              <td className="text-right text-[11px] font-bold text-slate-400 font-mono py-5 px-4">
                 {duration(trade.entry_time)}
               </td>
-              <td className="text-right">
+              <td className="text-right py-5 pr-0">
                 <button
                   onClick={() => handleExit(trade.id, trade.symbol)}
-                  className="p-1.5 rounded text-slate-600 hover:text-red-400 hover:bg-red-900/20 transition-colors"
-                  title="Exit trade"
+                  className="p-2 rounded-xl text-slate-300 hover:text-rose-600 hover:bg-rose-50 transition-all duration-200 shadow-xs border border-transparent hover:border-rose-100"
+                  title="Force Close Position"
                 >
-                  <X className="w-3.5 h-3.5" />
+                  <X className="w-4 h-4" />
                 </button>
               </td>
             </tr>
