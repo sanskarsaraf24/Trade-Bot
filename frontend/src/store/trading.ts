@@ -15,6 +15,7 @@ interface BotState {
   dailyPnl: number
   lastUpdate: string | null
   uptime: number | null
+  brokerType: string | null
   setStatus: (data: Partial<BotState>) => void
 }
 
@@ -39,7 +40,7 @@ export const useAuthStore = create<AuthState>()(
       email: null,
       setAuth: (token, userId, email) => set({ token, userId, email }),
       logout: () => {
-        localStorage.removeItem('trading_token')
+        if (typeof window !== 'undefined') localStorage.removeItem('trading_token')
         set({ token: null, userId: null, email: null })
       },
     }),
@@ -53,11 +54,12 @@ export const useBotStore = create<BotState>((set) => ({
   dailyPnl: 0,
   lastUpdate: null,
   uptime: null,
+  brokerType: null,
   setStatus: (data) => set((s) => ({ ...s, ...data })),
 }))
 
 export const useLogStore = create<LogState>((set) => ({
   logs: [],
-  addLog: (log) => set((s) => ({ logs: [log, ...s.logs].slice(0, 100) })),
+  addLog: (log) => set((s) => ({ logs: [log, ...s.logs].slice(0, 200) })),
   setLogs: (logs) => set({ logs }),
 }))

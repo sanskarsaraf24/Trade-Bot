@@ -1,4 +1,7 @@
-import json
+"""
+WebSocket manager — streams live trading events to connected frontends.
+The singleton `manager` (formerly `ws_manager`) is imported by trading_engine.
+"""
 import logging
 from typing import Dict, List
 
@@ -13,10 +16,9 @@ router = APIRouter()
 
 
 class WebSocketManager:
-    """Manages all active WebSocket connections."""
+    """Manages all active WebSocket connections, keyed by user_id."""
 
     def __init__(self):
-        # user_id → list of connected WebSockets
         self._connections: Dict[str, List[WebSocket]] = {}
 
     async def connect(self, websocket: WebSocket, user_id: str):
@@ -32,11 +34,14 @@ class WebSocketManager:
 
     async def send_to_user(self, user_id: str, message: dict):
         """Send a JSON message to all connections for a user."""
+        dead = []
         for ws in list(self._connections.get(user_id, [])):
             try:
                 await ws.send_json(message)
             except Exception:
-                self._connections[user_id].remove(ws)
+                dead.append(ws)
+        for ws in dead:
+            self._connections.get(user_id, []).remove(ws)
 
     async def broadcast_to_all(self, message: dict):
         for user_id in list(self._connections.keys()):
@@ -46,17 +51,20 @@ class WebSocketManager:
         return sum(len(v) for v in self._connections.values())
 
 
-# Global singleton — imported by trading_engine
-ws_manager = WebSocketManager()
+# ── Global singleton ─────────────────────────────────────────
+# Named `manager` so trading_engine can do: from routes.websocket import manager
+manager = WebSocketManager()
+
+# Backwards-compat alias (in case anything still references ws_manager)
+ws_manager = manager
 
 
 @router.websocket("/{user_id}")
 async def websocket_endpoint(websocket: WebSocket, user_id: str, token: str = Query(...)):
     """
-    ws://host/ws/{user_id}?token=<jwt>
+    ws://host/api/ws/{user_id}?token=<jwt>
     Streams: trade_update | metrics_update | log_event
     """
-    # Authenticate via JWT in query param
     try:
         payload = jwt.decode(token, settings.secret_key, algorithms=[settings.jwt_algorithm])
         token_user_id = payload.get("sub")
@@ -67,12 +75,11 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str, token: str = Qu
         await websocket.close(code=4001, reason="Invalid token")
         return
 
-    await ws_manager.connect(websocket, user_id)
+    await manager.connect(websocket, user_id)
     try:
         while True:
-            # Keep connection alive — client can also send pings
             data = await websocket.receive_text()
             if data == "ping":
                 await websocket.send_text("pong")
     except WebSocketDisconnect:
-        ws_manager.disconnect(websocket, user_id)
+        manager.disconnect(websocket, user_id)
