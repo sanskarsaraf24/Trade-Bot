@@ -22,6 +22,7 @@ export default function Dashboard() {
   const [openTrades, setOpenTrades] = useState([])
   const [closedTrades, setClosedTrades] = useState([])
   const [dailyMetrics, setDailyMetrics] = useState<any>({})
+  const [floatingPositions, setFloatingPositions] = useState<Record<string, {current_price: number, floating_pnl: number}>>({}) 
   const [loading, setLoading] = useState(true)
   const [wsConnected, setWsConnected] = useState(false)
   const [lastTradeFlash, setLastTradeFlash] = useState<string | null>(null)
@@ -59,7 +60,18 @@ export default function Dashboard() {
     if (!token) { router.push('/login'); return }
     refreshAll()
     const interval = setInterval(refreshAll, 20_000)
-    return () => clearInterval(interval)
+    // Poll REST floating P&L every 15s as fallback when WS isn't streaming
+    const floatInterval = setInterval(async () => {
+      try {
+        const { data } = await tradesApi.floatingPnl()
+        if (data?.positions?.length) {
+          const map: Record<string, {current_price: number, floating_pnl: number}> = {}
+          data.positions.forEach((p: any) => { map[p.symbol] = { current_price: p.current_price, floating_pnl: p.floating_pnl } })
+          setFloatingPositions(map)
+        }
+      } catch {}
+    }, 15_000)
+    return () => { clearInterval(interval); clearInterval(floatInterval) }
   }, [token, router, refreshAll])
 
   useTradingWS(userId, {
@@ -80,6 +92,14 @@ export default function Dashboard() {
         dailyPnl: data.daily_pnl as number,
         lastUpdate: data.last_update as string,
       })
+      // Capture live prices + floating P&L from engine's WS broadcast
+      if (data.open_positions_detail) {
+        const map: Record<string, {current_price: number, floating_pnl: number}> = {}
+        ;(data.open_positions_detail as any[]).forEach((p) => {
+          map[p.symbol] = { current_price: p.current_price, floating_pnl: p.floating_pnl }
+        })
+        setFloatingPositions(map)
+      }
       metricsApi.daily().then((r) => setDailyMetrics(r.data))
     },
     onLogEvent: (data) => addLog(data as any),
@@ -154,7 +174,7 @@ export default function Dashboard() {
                     {openTrades.length} Active
                   </span>
                 </div>
-                <OpenTradesTable trades={openTrades} onExit={refreshAll} />
+                <OpenTradesTable trades={openTrades} floatingPositions={floatingPositions} onExit={refreshAll} />
               </div>
 
               {/* History Table */}

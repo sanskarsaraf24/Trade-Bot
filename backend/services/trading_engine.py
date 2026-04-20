@@ -91,6 +91,36 @@ class TradingEngine:
         self.engine_id = str(uuid.uuid4())
         self._monitor_task: Optional[asyncio.Task] = None
 
+        # Restore any open positions from DB so P&L tracking survives restarts
+        self._restore_open_trades_from_db()
+
+    def _restore_open_trades_from_db(self):
+        """Reload open positions from DB into memory on engine start/restart."""
+        db = SessionLocal()
+        try:
+            open_db_trades = db.query(Trade).filter(
+                Trade.user_id == self.user_id,
+                Trade.status == TradeStatus.OPEN,
+            ).all()
+            for t in open_db_trades:
+                sig_val = t.signal.value if hasattr(t.signal, 'value') else str(t.signal)
+                self.open_trades[t.symbol] = {
+                    "trade_id": t.id,
+                    "entry": t.entry_price,
+                    "stop_loss": t.stop_loss or 0,
+                    "target": t.target or 0,
+                    "signal": sig_val,
+                    "qty": t.quantity,
+                    "symbol": t.symbol,
+                }
+            if open_db_trades:
+                logger.info(f"Restored {len(open_db_trades)} open trade(s) from DB into engine memory")
+                self.risk_manager.update_open_positions(len(self.open_trades))
+        except Exception as e:
+            logger.error(f"Failed to restore open trades: {e}")
+        finally:
+            db.close()
+
     # ─────────────────────────────────────────────────────────
     # Main loop
     # ─────────────────────────────────────────────────────────
@@ -131,28 +161,36 @@ class TradingEngine:
                 await self._log("info", "cycle_start", "🔄 Analysis cycle started")
 
                 # ── Strategy cycle ─────────────────────────────
-                market_data = await self._collect_market_data()
-                if not market_data:
-                    await self._log("warning", "no_data", "No market data collected — skipping cycle")
-                    await asyncio.sleep(60)
-                    continue
+                if len(self.open_trades) >= self.config.max_concurrent_positions:
+                    await self._log("info", "slots_full", f"Max slots ({self.config.max_concurrent_positions}) filled. Tracking open positions only.")
+                    signals = []
+                else:
+                    market_data = await self._collect_market_data()
+                    if not market_data:
+                        await self._log("warning", "no_data", "No market data collected — skipping cycle")
+                        await asyncio.sleep(60)
+                        continue
 
-                features = self._engineer_features(market_data)
+                    features = self._engineer_features(market_data)
 
-                signals = []
-                if self.claude and features:
-                    try:
-                        signals = self.claude.get_signals(features, self.config)
-                        await self._log(
-                            "info", "signals_received",
-                            f"📊 Claude returned {len(signals)} signals for {len(features)} symbols"
-                        )
-                    except Exception as e:
-                        await self._log("error", "claude_error", f"Claude API error: {e}")
+                    signals = []
+                    if self.claude and features:
+                        try:
+                            signals = self.claude.get_signals(features, self.config, len(self.open_trades))
+                            await self._log(
+                                "info", "signals_received",
+                                f"📊 Claude returned {len(signals)} signals for {len(features)} symbols"
+                            )
+                        except Exception as e:
+                            await self._log("error", "claude_error", f"Claude API error: {e}")
 
                 for signal in signals:
                     if signal["signal"] in ("HOLD", "EXIT"):
                         continue
+                    # BUG FIX: sync count from live open_trades so max_concurrent is enforced
+                    # even within a single signal batch (previously count was stale and allowed
+                    # multiple trades through before update_open_positions was called)
+                    self.risk_manager.update_open_positions(len(self.open_trades))
                     allowed, reason = self.risk_manager.can_execute(signal)
                     if allowed:
                         await self._execute_trade(signal)
@@ -244,18 +282,46 @@ class TradingEngine:
             await self._log("warning", "bad_levels", f"{symbol}: invalid SL/target in signal — skipping")
             return
 
-        qty = self.risk_manager.calculate_position_size(entry, sl)
+        max_qty = self.risk_manager.calculate_position_size(entry, sl)
+        ai_qty = signal.get("suggested_quantity")
+        if ai_qty and isinstance(ai_qty, (int, float)) and ai_qty > 0:
+            qty = min(int(ai_qty), max_qty)
+            await self._log("info", "ai_quantity_used", f"{symbol}: using AI suggested quantity {qty} (max allowed {max_qty})")
+        else:
+            qty = max_qty
+            
         if qty <= 0:
             await self._log("warning", "bad_qty", f"{symbol}: calculated qty=0 — skipping")
             return
 
-        # Place order
-        order = self.broker.place_order(symbol, signal["signal"], qty, "MARKET", entry)
+        # ── Minimum profit check (covers brokerage) ───────────
+        expected_profit = abs(tgt - entry) * qty
+        min_abs = getattr(self.config, "min_profit_absolute", None)
+        min_pct = getattr(self.config, "min_profit_percent", None)
+        expected_pct = (expected_profit / (entry * qty)) * 100 if entry and qty else 0
+        if min_abs and expected_profit < min_abs:
+            await self._log("warning", "min_profit_skip",
+                f"⚠️ {symbol}: expected profit ₹{expected_profit:.0f} < min ₹{min_abs:.0f} — skipping")
+            return
+        if min_pct and expected_pct < min_pct:
+            await self._log("warning", "min_profit_skip",
+                f"⚠️ {symbol}: expected profit {expected_pct:.2f}% < min {min_pct:.2f}% — skipping")
+            return
+
+        # Fetch a FRESH price from Zerodha REST right before execution — bypasses all caches
+        # This is the single source of truth for what the market is trading at right now
+        execution_ltp = self.broker.get_fresh_price(symbol)
+        logger.info(f"[EXEC] Pre-trade LTP for {symbol}: ₹{execution_ltp} (Claude suggested: ₹{entry})")
+
+        # Place order — use MIS for intraday margin leverage
+        # NOTE: For MARKET orders, we do NOT pass the 'entry' price to the broker
+        order = self.broker.place_order(symbol, signal["signal"], qty, "MARKET")
         if order.get("status") == "FAILED":
             await self._log("error", "order_failed", f"❌ Order failed for {symbol}: {order.get('error')}")
             return
 
-        # Persist to DB
+        # Persist to DB — use ACTUAL fill price from broker, or our fresh pre-trade LTP
+        actual_fill_price = order.get("price") or execution_ltp or entry
         db = SessionLocal()
         try:
             trade = Trade(
@@ -263,7 +329,7 @@ class TradingEngine:
                 bot_session_id=self.session_id,
                 symbol=symbol,
                 signal=signal["signal"],
-                entry_price=entry,
+                entry_price=actual_fill_price,
                 stop_loss=sl,
                 target=tgt,
                 quantity=qty,
@@ -278,7 +344,7 @@ class TradingEngine:
 
             self.open_trades[symbol] = {
                 "trade_id": trade.id,
-                "entry": entry,
+                "entry": actual_fill_price,
                 "stop_loss": sl,
                 "target": tgt,
                 "signal": signal["signal"],
@@ -292,17 +358,17 @@ class TradingEngine:
 
         await self._log(
             "info", "trade_opened",
-            f"🟢 OPENED {signal['signal']} {symbol} @ ₹{entry:.2f} | "
+            f"🟢 OPENED {signal['signal']} {symbol} @ ₹{actual_fill_price:.2f} (Claude: ₹{entry:.2f}) | "
             f"SL ₹{sl:.2f} | Target ₹{tgt:.2f} | Qty {qty} | Conf {signal['confidence']:.0f}%"
         )
-        await self.email_service.trade_opened(symbol, signal["signal"], entry, signal["confidence"])
+        await self.email_service.trade_opened(symbol, signal["signal"], actual_fill_price, signal["confidence"])
         await _get_ws_manager().send_to_user(self.user_id, {
             "type": "trade_update",
             "data": {
                 "action": "opened",
                 "symbol": symbol,
                 "signal": signal["signal"],
-                "entry": entry,
+                "entry": actual_fill_price,
                 "qty": qty,
             },
             "timestamp": datetime.now(IST).isoformat(),
@@ -321,14 +387,15 @@ class TradingEngine:
             if exit_price <= 0:
                 exit_price = trade.entry_price  # last resort fallback
 
-            # Place exit order
+            # Place exit order and use actual fill price for P&L calculation
             opp = "SELL" if "BUY" in trade.signal.value else "BUY"
-            self.broker.place_order(trade.symbol, opp, trade.quantity, "MARKET")
+            exit_order = self.broker.place_order(trade.symbol, opp, trade.quantity, "MARKET")
+            actual_exit_price = exit_order.get("price") or exit_price
 
-            pnl = self._calc_pnl(trade.signal, trade.entry_price, exit_price, trade.quantity)
-            trade.exit_price = exit_price
+            pnl = self._calc_pnl(trade.signal, trade.entry_price, actual_exit_price, trade.quantity)
+            trade.exit_price = actual_exit_price
             trade.exit_reason = reason
-            trade.exit_time = datetime.utcnow()
+            trade.exit_time = datetime.now(IST).replace(tzinfo=None)
             trade.status = TradeStatus.CLOSED
             trade.pnl = pnl
             trade.pnl_percent = (pnl / (trade.entry_price * trade.quantity)) * 100 if trade.entry_price else 0
@@ -369,10 +436,17 @@ class TradingEngine:
     # ─────────────────────────────────────────────────────────
     async def _run_monitoring_loop(self):
         """Check SL/Target hits continuously."""
+        _metrics_tick = 0
         while self.is_running:
             try:
                 if not self.is_paused and self._is_market_open():
                     await self._check_sl_target()
+                    # BUG FIX: broadcast floating P&L every 30s (6 × 5s ticks)
+                    # Previously metrics only broadcast after a full strategy cycle (5+ min)
+                    _metrics_tick += 1
+                    if _metrics_tick >= 6 and self.open_trades:
+                        await self._broadcast_metrics()
+                        _metrics_tick = 0
                 await asyncio.sleep(5)
             except asyncio.CancelledError:
                 break
@@ -383,7 +457,7 @@ class TradingEngine:
     async def _check_sl_target(self):
         for symbol, pos in list(self.open_trades.items()):
             try:
-                price = self.broker.get_price(symbol)
+                price = self.broker.get_fresh_price(symbol)
                 if not price or price <= 0:
                     continue
 
@@ -472,7 +546,7 @@ class TradingEngine:
         try:
             db.query(BotSession).filter(BotSession.id == self.session_id).update({
                 "status": BotStatus.stopped,
-                "stopped_at": datetime.utcnow(),
+                "stopped_at": datetime.now(IST).replace(tzinfo=None),
             })
             db.commit()
         finally:
@@ -516,12 +590,45 @@ class TradingEngine:
 
     async def _broadcast_metrics(self):
         try:
-            pnl = self._get_todays_pnl()
+            realized_pnl = self._get_todays_pnl()
+
+            # BUG FIX: compute floating (unrealized) P&L for open positions
+            floating_pnl = 0.0
+            open_positions_detail = []
+            for symbol, pos in self.open_trades.items():
+                try:
+                    # Always use fresh REST price for P&L — never stale cache
+                    current_price = self.broker.get_fresh_price(symbol)
+                    if current_price > 0:
+                        qty = pos.get("qty", 0)
+                        entry = pos.get("entry", 0)
+                        sig = pos.get("signal", "BUY")
+                        if "BUY" in sig:
+                            unreal = (current_price - entry) * qty
+                        else:
+                            unreal = (entry - current_price) * qty
+                        floating_pnl += unreal
+                        open_positions_detail.append({
+                            "symbol": symbol,
+                            "signal": sig,
+                            "entry": entry,
+                            "current_price": current_price,
+                            "qty": qty,
+                            "floating_pnl": round(unreal, 2),
+                            "stop_loss": pos.get("stop_loss", 0),
+                            "target": pos.get("target", 0),
+                        })
+                except Exception as e:
+                    logger.warning(f"Floating P&L calc failed for {symbol}: {e}")
+
             await _get_ws_manager().send_to_user(self.user_id, {
                 "type": "metrics_update",
                 "data": {
                     "open_positions": len(self.open_trades),
-                    "daily_pnl": pnl,
+                    "daily_pnl": realized_pnl,
+                    "floating_pnl": round(floating_pnl, 2),
+                    "total_pnl": round(realized_pnl + floating_pnl, 2),
+                    "open_positions_detail": open_positions_detail,
                     "last_update": self.last_update,
                 },
             })

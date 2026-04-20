@@ -1,5 +1,10 @@
 import uuid
 from datetime import datetime
+import pytz
+
+def ist_now():
+    return datetime.now(pytz.timezone('Asia/Kolkata')).replace(tzinfo=None)
+
 
 from sqlalchemy import (
     Boolean, Column, DateTime, Enum, Float, Integer,
@@ -59,7 +64,7 @@ class User(Base):
     email = Column(String, unique=True, nullable=False, index=True)
     hashed_password = Column(String, nullable=False)
     is_active = Column(Boolean, default=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=ist_now)
 
     config = relationship("TradingConfiguration", back_populates="user", uselist=False)
     trades = relationship("Trade", back_populates="user")
@@ -101,6 +106,13 @@ class TradingConfiguration(Base):
     timeframe = Column(Enum(Timeframe), default=Timeframe.intraday)
     analysis_interval_minutes = Column(Integer, default=15)
 
+    # Margin & Profit Constraints
+    margin_multiplier = Column(Float, default=1.0)
+    min_profit_absolute = Column(Float, nullable=True)
+    min_profit_percent = Column(Float, nullable=True)
+    default_stop_loss_percent = Column(Float, default=0.5)
+    default_target_percent = Column(Float, default=1.0)
+
     # Markets
     markets_enabled = Column(JSON, default=lambda: {"NSE_STOCKS": True, "NSE_OPTIONS": False})
 
@@ -123,8 +135,8 @@ class TradingConfiguration(Base):
 
     # Meta
     is_active = Column(Boolean, default=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=ist_now)
+    updated_at = Column(DateTime, default=ist_now, onupdate=ist_now)
 
     user = relationship("User", back_populates="config")
 
@@ -168,7 +180,7 @@ class Trade(Base):
     exit_reason = Column(String, nullable=True)  # SL_HIT, TARGET_HIT, MANUAL, EOD
 
     # Timestamps
-    entry_time = Column(DateTime, default=datetime.utcnow)
+    entry_time = Column(DateTime, default=ist_now)
     exit_time = Column(DateTime, nullable=True)
 
     user = relationship("User", back_populates="trades")
@@ -184,7 +196,7 @@ class BotSession(Base):
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     user_id = Column(String, ForeignKey("users.id"), nullable=False, index=True)
     status = Column(Enum(BotStatus), default=BotStatus.running)
-    started_at = Column(DateTime, default=datetime.utcnow)
+    started_at = Column(DateTime, default=ist_now)
     stopped_at = Column(DateTime, nullable=True)
 
     user = relationship("User", back_populates="bot_sessions")
@@ -202,6 +214,6 @@ class SystemLog(Base):
     event_type = Column(String, nullable=False)  # trade_opened, signal, error, info
     message = Column(Text, nullable=False)
     severity = Column(String, default="info")  # info | warning | error
-    timestamp = Column(DateTime, default=datetime.utcnow, index=True)
+    timestamp = Column(DateTime, default=ist_now, index=True)
 
     user = relationship("User", back_populates="logs")

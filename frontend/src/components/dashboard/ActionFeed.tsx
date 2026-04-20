@@ -65,7 +65,7 @@ export default function ActionFeed() {
                       {log.event_type.replace(/_/g, ' ')}
                     </span>
                     <span className="text-[10px] font-bold text-slate-400 font-mono">
-                      {format(new Date(log.timestamp), 'HH:mm:ss')}
+                      {format(new Date(log.timestamp + (log.timestamp.endsWith('Z') ? '' : 'Z')), 'HH:mm:ss')}
                     </span>
                   </div>
                 </div>

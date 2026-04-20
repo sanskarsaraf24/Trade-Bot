@@ -1,6 +1,6 @@
 'use client'
 import { tradesApi } from '@/lib/api'
-import { X, TrendingUp, TrendingDown, Target, Activity } from 'lucide-react'
+import { X, Edit2, Check, TrendingUp, TrendingDown, Target, Activity } from 'lucide-react'
 import clsx from 'clsx'
 
 interface Trade {
@@ -18,10 +18,26 @@ interface Trade {
   entry_time: string
 }
 
-function ProgressBar({ entry, current, sl, target, signal }: {
-  entry: number; current: number; sl: number; target: number; signal: string
+import { useState } from 'react'
+function ProgressBar({ tradeId, entry, current, sl: initialSl, target: initialTarget, signal, onUpdate }: {
+  tradeId: string; entry: number; current: number; sl: number; target: number; signal: string; onUpdate: () => void;
 }) {
-  if (!sl || !target || !entry) return null
+  const [isEditing, setIsEditing] = useState(false);
+  const [sl, setSl] = useState(initialSl);
+  const [target, setTarget] = useState(initialTarget);
+  const [updating, setUpdating] = useState(false);
+
+  const handleSave = async () => {
+    setUpdating(true);
+    try {
+      await tradesApi.updateTrade(tradeId, { stop_loss: sl, target });
+      setIsEditing(false);
+      onUpdate();
+    } catch { alert('Failed to update') }
+    setUpdating(false);
+  };
+
+  if (!initialSl || !initialTarget || !entry) return null
   const isBuy = signal.includes('BUY')
   const range = Math.abs(target - sl)
   if (range <= 0) return null
@@ -34,10 +50,28 @@ function ProgressBar({ entry, current, sl, target, signal }: {
   const isProfit = isBuy ? current > entry : current < entry
 
   return (
-    <div className="mt-2 group/progress">
-      <div className="flex justify-between text-[8px] font-bold uppercase tracking-widest mb-1 shadow-xs">
-        <span className="text-rose-500 bg-rose-50 px-1 rounded border border-rose-100">SL ₹{sl?.toLocaleString()}</span>
-        <span className="text-emerald-500 bg-emerald-50 px-1 rounded border border-emerald-100">Target ₹{target?.toLocaleString()}</span>
+    <div className="mt-2 group/progress relative">
+      <div className="flex justify-between items-center text-[8px] font-bold uppercase tracking-widest mb-1 shadow-xs">
+        {isEditing ? (
+          <div className="flex items-center gap-1">
+             <input type="number" step="0.1" value={sl} onChange={e => setSl(Number(e.target.value))} className="w-16 px-1 py-0.5 border border-rose-200 text-rose-600 rounded bg-rose-50" />
+          </div>
+        ) : (
+          <button onClick={() => setIsEditing(true)} className="text-rose-500 bg-rose-50 px-1 rounded border border-rose-100 hover:bg-rose-100 flex items-center gap-1 cursor-pointer">
+            SL ₹{sl?.toLocaleString()} <Edit2 className="w-2 h-2" />
+          </button>
+        )}
+        
+        {isEditing ? (
+          <div className="flex items-center gap-1">
+             <button onClick={handleSave} disabled={updating} className="bg-indigo-500 text-white p-0.5 rounded mr-1"><Check className="w-3 h-3" /></button>
+             <input type="number" step="0.1" value={target} onChange={e => setTarget(Number(e.target.value))} className="w-16 px-1 py-0.5 border border-emerald-200 text-emerald-600 rounded bg-emerald-50 text-right" />
+          </div>
+        ) : (
+          <button onClick={() => setIsEditing(true)} className="text-emerald-500 bg-emerald-50 px-1 rounded border border-emerald-100 hover:bg-emerald-100 flex items-center gap-1 cursor-pointer">
+            <Edit2 className="w-2 h-2" /> Target ₹{target?.toLocaleString()}
+          </button>
+        )}
       </div>
       <div className="h-1.5 bg-slate-100 rounded-full overflow-hidden shadow-inner">
         <div
@@ -54,9 +88,11 @@ function ProgressBar({ entry, current, sl, target, signal }: {
 
 export default function OpenTradesTable({
   trades,
+  floatingPositions = {},
   onExit,
 }: {
   trades: unknown[]
+  floatingPositions?: Record<string, {current_price: number, floating_pnl: number}>
   onExit: () => void
 }) {
   const typed = trades as Trade[]
@@ -79,27 +115,36 @@ export default function OpenTradesTable({
   }
 
   const duration = (entryTime: string) => {
-    const mins = Math.floor((Date.now() - new Date(entryTime).getTime()) / 60000)
+    const mins = Math.floor((Date.now() - new Date(entryTime + (entryTime.endsWith('Z') ? '' : 'Z')).getTime()) / 60000)
     if (mins < 60) return `${mins}m`
     return `${Math.floor(mins / 60)}h ${mins % 60}m`
   }
 
   return (
-    <div className="overflow-x-auto">
+    <div className="max-h-96 overflow-y-auto overflow-x-auto border-b border-slate-100 scrollbar-thin relative">
       <table className="data-table">
-        <thead>
+        <thead className="sticky top-0 bg-white shadow-sm z-10">
           <tr>
-            <th className="pl-0">Asset & Thesis</th>
-            <th>Signal</th>
-            <th className="text-right">Entry</th>
-            <th className="text-right">Floating P&L</th>
-            <th className="text-right">Conf</th>
-            <th className="text-right">Hold</th>
-            <th className="pr-0"></th>
+            <th className="pl-0 bg-white">Asset & Thesis</th>
+            <th className="bg-white">Signal</th>
+            <th className="text-right bg-white">Qty</th>
+            <th className="text-right bg-white">Entry / LTP</th>
+            <th className="text-right bg-white">Floating P&L</th>
+            <th className="text-right bg-white">Conf</th>
+            <th className="text-right bg-white">Hold</th>
+            <th className="pr-0 bg-white"></th>
           </tr>
         </thead>
         <tbody>
-          {typed.map((trade) => (
+          {typed.map((trade) => {
+            // Use live broker price from WS/REST polling if available
+            const liveData = floatingPositions[trade.symbol]
+            const livePnl = liveData ? liveData.floating_pnl : trade.pnl
+            const livePrice = liveData ? liveData.current_price : trade.entry_price
+            const livePnlPct = liveData && trade.entry_price && trade.quantity
+              ? (liveData.floating_pnl / (trade.entry_price * trade.quantity)) * 100
+              : trade.pnl_percent
+            return (
             <tr key={trade.id} className="animate-in fade-in slide-in-from-left-2 duration-300">
               <td className="max-w-[220px] py-5 pl-0">
                 <div className="flex items-center gap-2 mb-1.5">
@@ -111,11 +156,13 @@ export default function OpenTradesTable({
                   "{trade.claude_reasoning || 'No thesis provided'}"
                 </p>
                 <ProgressBar
+                  tradeId={trade.id}
                   entry={trade.entry_price}
-                  current={trade.entry_price + (trade.pnl / (trade.quantity || 1))}
+                  current={livePrice}
                   sl={trade.stop_loss}
                   target={trade.target}
                   signal={trade.signal}
+                  onUpdate={onExit}
                 />
               </td>
               <td className="py-5">
@@ -124,17 +171,20 @@ export default function OpenTradesTable({
                   {trade.signal.replace('_STOCK', '').replace('_', ' ')}
                 </span>
               </td>
-              <td className="text-right font-mono text-xs font-bold text-slate-900 py-5 px-4">
-                ₹{trade.entry_price.toLocaleString()}
+              <td className="text-right font-mono text-xs font-bold text-slate-600 py-5 px-4">{trade.quantity || '-'}</td>
+              <td className="text-right font-mono text-xs font-bold py-5 px-4">
+                <div className="text-slate-900">₹{trade.entry_price.toLocaleString()}</div>
+                {liveData && <div className="text-[10px] text-indigo-600 mt-0.5" title="Last Traded Price">LTP: ₹{livePrice.toLocaleString()}</div>}
               </td>
               <td className={clsx('text-right py-5 px-4')}>
                 <div className={clsx('flex items-center justify-end gap-1.5 font-black text-sm',
-                  trade.pnl >= 0 ? 'text-emerald-600' : 'text-rose-600')}>
-                  {trade.pnl >= 0 ? '+' : ''}₹{Math.abs(trade.pnl).toLocaleString()}
+                  livePnl >= 0 ? 'text-emerald-600' : 'text-rose-600')}>
+                  {liveData && <span className="text-[8px] font-black tracking-widest text-indigo-400 mr-1">LIVE</span>}
+                  {livePnl >= 0 ? '+' : ''}₹{Math.abs(livePnl).toLocaleString()}
                 </div>
                 <div className={clsx('text-[10px] font-bold uppercase tracking-widest mt-0.5',
-                  trade.pnl_percent >= 0 ? 'text-emerald-500' : 'text-rose-500')}>
-                  {trade.pnl_percent >= 0 ? '+' : ''}{trade.pnl_percent?.toFixed(2)}% ROI
+                  livePnlPct >= 0 ? 'text-emerald-500' : 'text-rose-500')}>
+                  {livePnlPct >= 0 ? '+' : ''}{livePnlPct?.toFixed(2)}% ROI
                 </div>
               </td>
               <td className="text-right py-5 px-4">
@@ -158,7 +208,8 @@ export default function OpenTradesTable({
                 </button>
               </td>
             </tr>
-          ))}
+            )
+          })}
         </tbody>
       </table>
     </div>

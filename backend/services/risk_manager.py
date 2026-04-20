@@ -50,7 +50,8 @@ class RiskManager:
         Qty = (capital × risk%) / |entry - SL|
         """
         capital = self.config.account_balance
-        risk_amount = capital * (self.config.risk_per_trade_percent / 100)
+        margin = getattr(self.config, "margin_multiplier", 1.0) or 1.0
+        risk_amount = (capital * margin) * (self.config.risk_per_trade_percent / 100)
         price_risk = abs(entry_price - stop_loss)
 
         if price_risk <= 0:
@@ -68,18 +69,15 @@ class RiskManager:
         self._open_position_count = count
 
     # ─── Suggested SL/Target ─────────────────────────────────
-    def suggest_stop_loss(self, signal_type: str, entry: float, atr: Optional[float]) -> float:
-        """Fallback SL = 1.5× ATR below/above entry."""
-        multiplier = 1.5
-        if atr and atr > 0:
-            distance = atr * multiplier
-        else:
-            distance = entry * 0.005   # 0.5% of price
-
+    def suggest_stop_loss(self, signal_type: str, entry: float, atr: Optional[float] = None) -> float:
+        """Fallback SL distance from global percentage setting."""
+        pct = getattr(self.config, "default_stop_loss_percent", 0.5) / 100.0
+        distance = entry * pct
         return round(entry - distance if "BUY" in signal_type else entry + distance, 2)
 
-    def suggest_target(self, signal_type: str, entry: float, stop_loss: float,
+    def suggest_target(self, signal_type: str, entry: float, stop_loss: Optional[float] = None,
                        risk_reward: float = 2.0) -> float:
-        """Target = entry ± (SL distance × RR ratio)."""
-        distance = abs(entry - stop_loss) * risk_reward
+        """Fallback Target distance from global percentage setting."""
+        pct = getattr(self.config, "default_target_percent", 1.0) / 100.0
+        distance = entry * pct
         return round(entry + distance if "BUY" in signal_type else entry - distance, 2)

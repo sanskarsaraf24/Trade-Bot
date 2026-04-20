@@ -80,13 +80,12 @@ def _fetch_live_price(symbol: str) -> Optional[float]:
 class PaperBroker(BaseBroker):
     """
     Simulates trading with realistic price data.
-    1. On first access, tries to fetch live NSE price from Yahoo Finance.
-    2. Falls back to seed prices with random walk if Yahoo is unavailable.
+    If Zerodha credentials exist, polls Zerodha API every 10s.
+    Otherwise falls back to seed prices / Yahoo Finance.
     """
-
-    def __init__(self, starting_balance: float = 1_000_000):
+    def __init__(self, starting_balance: float = 100000.0, live_broker=None):
         self.balance = starting_balance
-        self.positions: Dict[str, dict] = {}
+        self.live_broker = live_broker
         self._price_cache: Dict[str, float] = {}
         self._last_fetch: Dict[str, float] = {}
         self._orders: list = []
@@ -96,19 +95,43 @@ class PaperBroker(BaseBroker):
         # Small random walk: ±0.3% from seed
         return round(seed * (1 + random.uniform(-0.003, 0.003)), 2)
 
+    def get_fresh_price(self, symbol: str) -> float:
+        """Bypass all caching — always call the source (live_broker REST or Yahoo)."""
+        if self.live_broker:
+            try:
+                return self.live_broker.get_fresh_price(symbol)
+            except Exception:
+                pass
+        # Yahoo fallback for pure paper mode
+        live = _fetch_live_price(symbol)
+        if live and live > 0:
+            self._price_cache[symbol] = live
+            self._last_fetch[symbol] = time.time()
+            return live
+        return self._price_cache.get(symbol, self._get_seed_price(symbol))
+
     def get_price(self, symbol: str) -> float:
         now = time.time()
         last = self._last_fetch.get(symbol, 0)
 
-        # Refresh every 60 seconds
-        if now - last > 60:
+        # Refresh every 10 seconds using Zerodha if available, else 5s Yahoo tick
+        if self.live_broker and (now - last > 10):
+            try:
+                live = self.live_broker.get_fresh_price(symbol)
+                if live and live > 0:
+                    self._price_cache[symbol] = live
+                    self._last_fetch[symbol] = now
+                    return live
+            except Exception:
+                pass
+
+        if not self.live_broker and (now - last > 5):
             live = _fetch_live_price(symbol)
             if live and live > 0:
-                self._price_cache[symbol] = live
+                self._price_cache[symbol] = live * (1 + random.uniform(-0.0005, 0.0005))
             elif symbol not in self._price_cache:
                 self._price_cache[symbol] = self._get_seed_price(symbol)
             else:
-                # Small random walk on cached price
                 prev = self._price_cache[symbol]
                 self._price_cache[symbol] = round(prev * (1 + random.uniform(-0.002, 0.002)), 2)
             self._last_fetch[symbol] = now
@@ -147,7 +170,12 @@ class PaperBroker(BaseBroker):
 
     def place_order(self, symbol: str, action: str, quantity: int,
                     order_type: str = "MARKET", price: Optional[float] = None) -> dict:
-        exec_price = price or self.get_price(symbol)
+        # For MARKET orders, always use the current LTP to prevent stale entry prices
+        if order_type.upper() == "MARKET":
+            exec_price = self.get_price(symbol)
+        else:
+            exec_price = price or self.get_price(symbol)
+            
         slippage = exec_price * random.uniform(-0.0005, 0.0005)
         final_price = round(exec_price + slippage, 2)
 
@@ -316,21 +344,28 @@ class ZerodhaBroker(BaseBroker):
             except Exception as e:
                 logger.warning(f"WebSocket subscribe error: {e}")
 
+    def get_fresh_price(self, symbol: str) -> float:
+        """Always fetches from Zerodha REST API — never uses the cache.
+        Use this at order execution time and for P&L calculations."""
+        try:
+            exchange_symbol = f"NSE:{symbol}"
+            data = self.kite.ltp([exchange_symbol])
+            if exchange_symbol in data:
+                price = float(data[exchange_symbol]["last_price"])
+                self.ltp_cache[symbol] = price  # keep cache in sync
+                logger.info(f"[LTP REST] {symbol} = ₹{price}")
+                return price
+        except Exception as e:
+            logger.warning(f"get_fresh_price REST failed for {symbol}: {e}")
+        # Fallback to cache if REST fails
+        return self.ltp_cache.get(symbol, 0.0)
+
     def get_price(self, symbol: str) -> float:
         # Prefer WebSocket cached price (freshest)
         if symbol in self.ltp_cache:
             return self.ltp_cache[symbol]
         # Fallback to REST
-        try:
-            exchange_symbol = f"NSE:{symbol}"
-            data = self.kite.ltp([exchange_symbol])
-            if exchange_symbol in data:
-                price = data[exchange_symbol]["last_price"]
-                self.ltp_cache[symbol] = price
-                return float(price)
-        except Exception as e:
-            logger.warning(f"get_price failed for {symbol}: {e}")
-        return 0.0
+        return self.get_fresh_price(symbol)
 
     def get_ohlcv(self, symbol: str, bars: int = 100, interval: str = "5minute") -> list[dict]:
         to_date = date.today()
@@ -355,35 +390,55 @@ class ZerodhaBroker(BaseBroker):
             return []
 
     def place_order(self, symbol: str, action: str, quantity: int,
-                    order_type: str = "MARKET", price: Optional[float] = None) -> dict:
+                    order_type: str = "MARKET", price: Optional[float] = None,
+                    trigger_price: Optional[float] = None) -> dict:
         if not self.access_token:
             return {"error": "No valid session token. Re-link Zerodha.", "status": "FAILED"}
         try:
-            from kiteconnect import KiteConnect
             transaction = (
                 self.kite.TRANSACTION_TYPE_BUY
                 if action in ("BUY", "BUY_STOCK", "BUY_CALL", "BUY_PUT")
                 else self.kite.TRANSACTION_TYPE_SELL
             )
-            kite_order_type = (
-                self.kite.ORDER_TYPE_MARKET
-                if order_type == "MARKET"
-                else self.kite.ORDER_TYPE_LIMIT
-            )
+            # Map order types to Kite constants
+            # MIS = intraday with margin leverage (not MTF, which requires separate approval)
+            _type_map = {
+                "MARKET": self.kite.ORDER_TYPE_MARKET,
+                "LIMIT":  self.kite.ORDER_TYPE_LIMIT,
+                "SL":     self.kite.ORDER_TYPE_SL,
+                "SL-M":   self.kite.ORDER_TYPE_SLM,
+            }
+            kite_order_type = _type_map.get(order_type.upper(), self.kite.ORDER_TYPE_MARKET)
+
             order_id = self.kite.place_order(
+                variety=self.kite.VARIETY_REGULAR,
                 tradingsymbol=symbol,
                 exchange=self.kite.EXCHANGE_NSE,
                 transaction_type=transaction,
                 quantity=quantity,
-                product=self.kite.PRODUCT_MIS,
+                product=self.kite.PRODUCT_MIS,      # MIS = intraday margin (leveraged)
                 order_type=kite_order_type,
-                price=price if order_type != "MARKET" else None,
+                price=price if order_type in ("LIMIT", "SL") else None,
+                trigger_price=trigger_price if order_type in ("SL", "SL-M") else None,
             )
-            logger.info(f"[ZERODHA] {action} {quantity}x {symbol} → order_id={order_id}")
+            logger.info(f"[ZERODHA] {action} {quantity}x {symbol} [{order_type}] → order_id={order_id}")
             return {"order_id": order_id, "status": "PLACED"}
         except Exception as e:
             logger.error(f"place_order failed for {symbol}: {e}")
             return {"error": str(e), "status": "FAILED"}
+
+    def place_sl_order(self, symbol: str, action: str, quantity: int,
+                       trigger_price: float, limit_price: Optional[float] = None) -> dict:
+        """
+        Place a Stop-Loss Market (SL-M) order — automatically triggered at trigger_price.
+        Use this for automated stop-loss protection after a position is entered.
+        SL-M is preferred over SL-L for bots as it guarantees execution at market price.
+        """
+        order_type = "SL" if limit_price else "SL-M"
+        return self.place_order(symbol, action, quantity,
+                                order_type=order_type,
+                                price=limit_price,
+                                trigger_price=trigger_price)
 
     def get_account_balance(self) -> float:
         try:
@@ -423,5 +478,19 @@ def create_broker(
             access_token=access_token or None,
             totp_secret=totp_secret or None,
         )
+        
+    live_ref = None
+    if api_key and access_token:
+        try:
+            logger.info("Initializing background ZerodhaBroker for precise Paper ticker prices...")
+            live_ref = ZerodhaBroker(
+                api_key=api_key,
+                api_secret=api_secret,
+                access_token=access_token or None,
+                totp_secret=totp_secret or None,
+            )
+        except Exception as e:
+            logger.warning(f"Could not init background Zerodha: {e}")
+
     logger.info("Using Paper Broker (simulation mode)")
-    return PaperBroker(starting_balance=balance)
+    return PaperBroker(starting_balance=balance, live_broker=live_ref)

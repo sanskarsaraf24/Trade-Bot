@@ -11,6 +11,7 @@ interface Trade {
   pnl: number
   exit_reason: string
   exit_time: string
+  quantity?: number
   confidence: number
 }
 
@@ -29,17 +30,18 @@ export default function RecentTradesTable({ trades }: { trades: unknown[] }) {
   }[r] || r)
 
   return (
-    <div className="overflow-x-auto">
+    <div className="max-h-96 overflow-y-auto overflow-x-auto border-b border-slate-100 scrollbar-thin relative">
       <table className="data-table">
-        <thead>
+        <thead className="sticky top-0 bg-white shadow-sm z-10">
           <tr>
-            <th className="pl-0">Asset</th>
-            <th>Signal</th>
-            <th className="text-right">Entry</th>
-            <th className="text-right">Exit</th>
-            <th className="text-right">Net P&L</th>
-            <th>Reason</th>
-            <th className="text-right pr-0">Timestamp</th>
+            <th className="pl-0 bg-white">Asset</th>
+            <th className="bg-white">Signal</th>
+            <th className="text-right bg-white">Qty</th>
+            <th className="text-right bg-white">Entry</th>
+            <th className="text-right bg-white">Exit</th>
+            <th className="text-right bg-white">Net P&L</th>
+            <th className="bg-white">Reason</th>
+            <th className="text-right pr-0 bg-white">Timestamp</th>
           </tr>
         </thead>
         <tbody>
@@ -52,6 +54,7 @@ export default function RecentTradesTable({ trades }: { trades: unknown[] }) {
                   {trade.signal.replace('_STOCK', '').replace('_', ' ')}
                 </span>
               </td>
+              <td className="text-right font-mono text-xs font-bold text-slate-600 py-4 px-4">{trade.quantity || '-'}</td>
               <td className="text-right font-mono text-xs font-bold text-slate-600 py-4 px-4">₹{trade.entry_price?.toLocaleString()}</td>
               <td className="text-right font-mono text-xs font-bold text-slate-600 py-4 px-4">₹{trade.exit_price?.toLocaleString()}</td>
               <td className={clsx('text-right font-mono font-black text-sm py-4 px-4',
@@ -67,7 +70,7 @@ export default function RecentTradesTable({ trades }: { trades: unknown[] }) {
               </td>
               <td className="text-right text-[10px] font-bold text-slate-400 uppercase tracking-widest py-4 pr-0">
                 {trade.exit_time
-                  ? format(new Date(trade.exit_time), 'hh:mm a')
+                  ? format(new Date(trade.exit_time + (trade.exit_time.endsWith('Z') ? '' : 'Z')), 'hh:mm a')
                   : '—'}
               </td>
             </tr>

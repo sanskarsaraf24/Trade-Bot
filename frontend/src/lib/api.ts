@@ -57,6 +57,8 @@ export const tradesApi = {
   closed: (limit = 30) => api.get(`/trades/closed?limit=${limit}`),
   exitOne: (tradeId: string) => api.post(`/trades/exit/${tradeId}`),
   exitAll: () => api.post('/trades/exit-all'),
+  floatingPnl: () => api.get('/trades/floating-pnl'),
+  updateTrade: (tradeId: string, data: { stop_loss?: number, target?: number }) => api.post(`/trades/update/${tradeId}`, data),
 }
 
 export const metricsApi = {
