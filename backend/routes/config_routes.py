@@ -33,6 +33,12 @@ class ConfigRequest(BaseModel):
     timeframe: str = "intraday"
     analysis_interval_minutes: int = 15
 
+    margin_multiplier: float = 1.0
+    min_profit_absolute: Optional[float] = None
+    min_profit_percent: Optional[float] = None
+    default_stop_loss_percent: float = 0.5
+    default_target_percent: float = 1.0
+
     markets_enabled: dict = {"NSE_STOCKS": True, "NSE_OPTIONS": False}
     enabled_strategies: List[str] = []
     avoid_trading_during: List[str] = []
