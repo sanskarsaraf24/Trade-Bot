@@ -23,12 +23,12 @@ class ClaudeService:
         # Use the latest efficient model
         self.model = "claude-haiku-4-5"
 
-    def get_signals(self, features: dict, config) -> list[dict]:
+    def get_signals(self, features: dict, config, open_positions: int = 0) -> list[dict]:
         """
         Analyze market features and return structured trade signals.
         Returns list of signal dicts.
         """
-        prompt = self._build_prompt(features, config)
+        prompt = self._build_prompt(features, config, open_positions=open_positions)
 
         try:
             message = self.client.messages.create(
@@ -58,7 +58,7 @@ class ClaudeService:
             logger.error(f"Claude service error: {e}")
             return []
 
-    def _build_prompt(self, features: dict, config) -> str:
+    def _build_prompt(self, features: dict, config, open_positions: int = 0) -> str:
         symbols_block = ""
         for symbol, feat in features.items():
             symbols_block += f"\n### {symbol}\n"
@@ -92,6 +92,7 @@ ACCOUNT:
 - Risk Per Trade: ₹{risk_amt:,.0f} ({config.risk_per_trade_percent}%)
 - Min Confidence: {config.min_confidence_threshold}%
 - Timeframe: {config.timeframe}
+- Open Positions: {open_positions}/{config.max_concurrent_positions}
 - Strategy Focus: {strategies}
 - Avoid: {avoid}
 
@@ -99,10 +100,10 @@ SYMBOLS:
 {symbols_block}
 
 RULES:
-1. Only recommend if confidence >= {config.min_confidence_threshold}%
+1. Only recommend a trade if confidence >= {config.min_confidence_threshold}%
 2. Stop-loss MUST be meaningful (not too tight or wide) — use ATR as guide
 3. Risk:Reward must be minimum 1:1.5
-4. Include HOLD for symbols where no clear setup exists
+4. DO NOT FORCE TRADES. If there is no high-probability, clear setup, you MUST return "HOLD". Refusing to trade in choppy or unclear markets is exactly what you are supposed to do.
 5. Return ONLY valid JSON, no markdown, no commentary
 
 JSON FORMAT (include ALL analyzed symbols):
