@@ -90,6 +90,7 @@ class TradingEngine:
         self.last_update: Optional[str] = None
         self.engine_id = str(uuid.uuid4())
         self._monitor_task: Optional[asyncio.Task] = None
+        self._last_feed_connected: Optional[bool] = None
 
         # Restore any open positions from DB so P&L tracking survives restarts
         self._restore_open_trades_from_db()
@@ -383,7 +384,7 @@ class TradingEngine:
                 return
 
             if exit_price <= 0:
-                exit_price = self.broker.get_price(trade.symbol)
+                exit_price = self.broker.get_fresh_price(trade.symbol)
             if exit_price <= 0:
                 exit_price = trade.entry_price  # last resort fallback
 
@@ -410,9 +411,9 @@ class TradingEngine:
             emoji = "🟢" if pnl >= 0 else "🔴"
             await self._log(
                 "info", "trade_closed",
-                f"{emoji} CLOSED {trade.symbol} [{reason}] @ ₹{exit_price:.2f} | P&L ₹{pnl:+.2f}"
+                f"{emoji} CLOSED {trade.symbol} [{reason}] @ ₹{actual_exit_price:.2f} | P&L ₹{pnl:+.2f}"
             )
-            await self.email_service.trade_closed(trade.symbol, trade.signal.value, exit_price, pnl, reason)
+            await self.email_service.trade_closed(trade.symbol, trade.signal.value, actual_exit_price, pnl, reason)
 
         finally:
             db.close()
@@ -435,18 +436,15 @@ class TradingEngine:
     # Monitoring loop (runs every 5 seconds)
     # ─────────────────────────────────────────────────────────
     async def _run_monitoring_loop(self):
-        """Check SL/Target hits continuously."""
-        _metrics_tick = 0
+        """Check SL/Target and broadcast live P&L every 5 seconds."""
         while self.is_running:
             try:
                 if not self.is_paused and self._is_market_open():
                     await self._check_sl_target()
-                    # BUG FIX: broadcast floating P&L every 30s (6 × 5s ticks)
-                    # Previously metrics only broadcast after a full strategy cycle (5+ min)
-                    _metrics_tick += 1
-                    if _metrics_tick >= 6 and self.open_trades:
+                    # Broadcast P&L + LTP on EVERY tick (every 5s) when positions are open
+                    if self.open_trades:
+                        self.last_update = datetime.now(IST).isoformat()
                         await self._broadcast_metrics()
-                        _metrics_tick = 0
                 await asyncio.sleep(5)
             except asyncio.CancelledError:
                 break
@@ -621,6 +619,31 @@ class TradingEngine:
                 except Exception as e:
                     logger.warning(f"Floating P&L calc failed for {symbol}: {e}")
 
+            feed_status = {}
+            if hasattr(self.broker, "get_feed_status"):
+                try:
+                    feed_status = self.broker.get_feed_status() or {}
+                except Exception:
+                    feed_status = {}
+
+            connected = feed_status.get("connected")
+            source = feed_status.get('source', 'unknown')
+            if connected is not None and connected != self._last_feed_connected:
+                self._last_feed_connected = connected
+                if connected:
+                    if source and "yahoo" not in source:
+                        await self._log(
+                            "info",
+                            "market_feed_restored",
+                            f"📡 Live feed active via {source}"
+                        )
+                else:
+                    await self._log(
+                        "warning",
+                        "market_feed_degraded",
+                        f"⚠️ Live market feed degraded. Fallback source: {source}"
+                    )
+
             await _get_ws_manager().send_to_user(self.user_id, {
                 "type": "metrics_update",
                 "data": {
@@ -629,6 +652,7 @@ class TradingEngine:
                     "floating_pnl": round(floating_pnl, 2),
                     "total_pnl": round(realized_pnl + floating_pnl, 2),
                     "open_positions_detail": open_positions_detail,
+                    "feed_status": feed_status,
                     "last_update": self.last_update,
                 },
             })

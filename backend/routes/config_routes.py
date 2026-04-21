@@ -17,6 +17,7 @@ class ConfigRequest(BaseModel):
     account_balance: float = 100000
     daily_profit_target: float = 5000
     daily_loss_limit: float = 3000
+    max_daily_loss_percent: float = 2.0
     risk_per_trade_percent: float = 1.0
     risk_appetite: str = "moderate"
 
@@ -87,14 +88,6 @@ async def save_config(
     db: Session = Depends(get_db),
 ):
     """Save or update trading configuration."""
-    # Guard rails
-    if req.daily_loss_limit > req.account_balance * 0.10:
-        raise HTTPException(status_code=400, detail="Daily loss limit cannot exceed 10% of balance")
-    if req.max_concurrent_positions > 10:
-        raise HTTPException(status_code=400, detail="Max 10 concurrent positions allowed")
-    if req.risk_per_trade_percent > 5:
-        raise HTTPException(status_code=400, detail="Risk per trade cannot exceed 5%")
-
     config = db.query(TradingConfiguration).filter(
         TradingConfiguration.user_id == current_user.id
     ).first()

@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     broker_type: str = "paper"  # "paper" | "zerodha" | "angel"
     zerodha_api_key: str = ""
     zerodha_api_secret: str = ""
+    zerodha_totp_secret: str = ""
     angel_api_key: str = ""
     angel_client_id: str = ""
     angel_password: str = ""

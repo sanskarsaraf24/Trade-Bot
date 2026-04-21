@@ -9,6 +9,7 @@ import random
 from abc import ABC, abstractmethod
 from datetime import date, datetime, timedelta
 from typing import Dict, List, Optional
+from config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +20,10 @@ logger = logging.getLogger(__name__)
 class BaseBroker(ABC):
     @abstractmethod
     def get_price(self, symbol: str) -> float: ...
+
+    def get_fresh_price(self, symbol: str) -> float:
+        """Default fresh-price behavior: delegate to get_price()."""
+        return self.get_price(symbol)
 
     @abstractmethod
     def get_ohlcv(self, symbol: str, bars: int, interval: str) -> list[dict]: ...
@@ -33,6 +38,15 @@ class BaseBroker(ABC):
     def subscribe_symbols(self, symbols: list[str]):
         """No-op for brokers that don't use WebSocket streaming."""
         pass
+
+    def get_feed_status(self) -> dict:
+        """Best-effort feed health for dashboard/engine observability."""
+        return {
+            "source": self.__class__.__name__,
+            "connected": True,
+            "last_success_ts": None,
+            "last_error": "",
+        }
 
 
 # ─────────────────────────────────────────────────────────────
@@ -89,6 +103,19 @@ class PaperBroker(BaseBroker):
         self._price_cache: Dict[str, float] = {}
         self._last_fetch: Dict[str, float] = {}
         self._orders: list = []
+        self._feed_status = {
+            "source": "seed",
+            "connected": False,
+            "last_success_ts": None,
+            "last_error": "",
+        }
+
+    def _mark_feed(self, source: str, connected: bool, error: str = ""):
+        self._feed_status["source"] = source
+        self._feed_status["connected"] = connected
+        self._feed_status["last_error"] = error
+        if connected:
+            self._feed_status["last_success_ts"] = datetime.now().isoformat()
 
     def _get_seed_price(self, symbol: str) -> float:
         seed = SEED_PRICES.get(symbol, 500.0)
@@ -96,44 +123,57 @@ class PaperBroker(BaseBroker):
         return round(seed * (1 + random.uniform(-0.003, 0.003)), 2)
 
     def get_fresh_price(self, symbol: str) -> float:
-        """Bypass all caching — always call the source (live_broker REST or Yahoo)."""
+        """Bypass all caching. Always calls Zerodha REST if available — NEVER Yahoo."""
         if self.live_broker:
             try:
-                return self.live_broker.get_fresh_price(symbol)
-            except Exception:
-                pass
-        # Yahoo fallback for pure paper mode
-        live = _fetch_live_price(symbol)
-        if live and live > 0:
-            self._price_cache[symbol] = live
-            self._last_fetch[symbol] = time.time()
-            return live
+                live = self.live_broker.get_fresh_price(symbol)
+                if live and live > 0:
+                    self._mark_feed("zerodha_rest", True)
+                    self._price_cache[symbol] = live
+                    self._last_fetch[symbol] = time.time()
+                    return live
+            except Exception as e:
+                self._mark_feed("zerodha_rest", False, str(e))
+                logger.warning(f"[PaperBroker] Zerodha REST failed for {symbol}: {e}")
+        # Only use Yahoo if there is no live_broker at all (pure paper, no creds)
+        if not self.live_broker:
+            live = _fetch_live_price(symbol)
+            if live and live > 0:
+                self._price_cache[symbol] = live
+                self._last_fetch[symbol] = time.time()
+                self._mark_feed("yahoo", True)
+                return live
+        self._mark_feed("seed", False, "Zerodha REST unavailable")
         return self._price_cache.get(symbol, self._get_seed_price(symbol))
 
     def get_price(self, symbol: str) -> float:
         now = time.time()
         last = self._last_fetch.get(symbol, 0)
 
-        # Refresh every 10 seconds using Zerodha if available, else 5s Yahoo tick
-        if self.live_broker and (now - last > 10):
+        # Refresh every 2 seconds using Zerodha if available, else 3s Yahoo tick
+        if self.live_broker and (now - last > 2):
             try:
                 live = self.live_broker.get_fresh_price(symbol)
                 if live and live > 0:
                     self._price_cache[symbol] = live
                     self._last_fetch[symbol] = now
+                    self._mark_feed("zerodha_rest", True)
                     return live
-            except Exception:
-                pass
+            except Exception as e:
+                self._mark_feed("zerodha_rest", False, str(e))
 
-        if not self.live_broker and (now - last > 5):
+        if not self.live_broker and (now - last > 3):
             live = _fetch_live_price(symbol)
             if live and live > 0:
                 self._price_cache[symbol] = live * (1 + random.uniform(-0.0005, 0.0005))
+                self._mark_feed("yahoo", True)
             elif symbol not in self._price_cache:
                 self._price_cache[symbol] = self._get_seed_price(symbol)
+                self._mark_feed("seed", False, "Yahoo unavailable")
             else:
                 prev = self._price_cache[symbol]
                 self._price_cache[symbol] = round(prev * (1 + random.uniform(-0.002, 0.002)), 2)
+                self._mark_feed("seed", False, "Using synthetic walk fallback")
             self._last_fetch[symbol] = now
 
         return self._price_cache.get(symbol, self._get_seed_price(symbol))
@@ -201,6 +241,9 @@ class PaperBroker(BaseBroker):
     def get_account_balance(self) -> float:
         return round(self.balance, 2)
 
+    def get_feed_status(self) -> dict:
+        return dict(self._feed_status)
+
 
 # ─────────────────────────────────────────────────────────────
 # Zerodha Broker
@@ -217,6 +260,9 @@ class ZerodhaBroker(BaseBroker):
         self.ltp_cache: Dict[str, float] = {}
         self.ticker = None
         self.access_token: Optional[str] = None
+        self._ws_connected: bool = False
+        self._last_ws_error: str = ""
+        self._last_rest_success_ts: str = ""
 
         try:
             from kiteconnect import KiteConnect
@@ -307,12 +353,16 @@ class ZerodhaBroker(BaseBroker):
                                 break
 
             def on_connect(ws, response):
+                self._ws_connected = True
+                self._last_ws_error = ""
                 if self.instrument_tokens:
                     tokens = list(self.instrument_tokens.values())
                     ws.subscribe(tokens)
                     ws.set_mode(ws.MODE_FULL, tokens)
 
             def on_error(ws, code, reason):
+                self._ws_connected = False
+                self._last_ws_error = f"{code}: {reason}"
                 logger.error(f"Kite WebSocket error {code}: {reason}")
 
             self.ticker.on_ticks = on_ticks
@@ -353,6 +403,7 @@ class ZerodhaBroker(BaseBroker):
             if exchange_symbol in data:
                 price = float(data[exchange_symbol]["last_price"])
                 self.ltp_cache[symbol] = price  # keep cache in sync
+                self._last_rest_success_ts = datetime.now().isoformat()
                 logger.info(f"[LTP REST] {symbol} = ₹{price}")
                 return price
         except Exception as e:
@@ -409,23 +460,77 @@ class ZerodhaBroker(BaseBroker):
                 "SL-M":   self.kite.ORDER_TYPE_SLM,
             }
             kite_order_type = _type_map.get(order_type.upper(), self.kite.ORDER_TYPE_MARKET)
+            is_market = kite_order_type == self.kite.ORDER_TYPE_MARKET
 
-            order_id = self.kite.place_order(
-                variety=self.kite.VARIETY_REGULAR,
-                tradingsymbol=symbol,
-                exchange=self.kite.EXCHANGE_NSE,
-                transaction_type=transaction,
-                quantity=quantity,
-                product=self.kite.PRODUCT_MIS,      # MIS = intraday margin (leveraged)
-                order_type=kite_order_type,
-                price=price if order_type in ("LIMIT", "SL") else None,
-                trigger_price=trigger_price if order_type in ("SL", "SL-M") else None,
-            )
+            # Zerodha may reject API MARKET orders without market protection.
+            # First try with market_protection; if still rejected, retry as protective LIMIT.
+            order_kwargs = {
+                "variety": self.kite.VARIETY_REGULAR,
+                "tradingsymbol": symbol,
+                "exchange": self.kite.EXCHANGE_NSE,
+                "transaction_type": transaction,
+                "quantity": quantity,
+                "product": self.kite.PRODUCT_MIS,
+                "order_type": kite_order_type,
+                "price": price if order_type in ("LIMIT", "SL") else None,
+                "trigger_price": trigger_price if order_type in ("SL", "SL-M") else None,
+            }
+            if is_market:
+                order_kwargs["market_protection"] = 2
+
+            try:
+                order_id = self.kite.place_order(**order_kwargs)
+            except Exception as e:
+                err_text = str(e)
+                if is_market and "market protection" in err_text.lower():
+                    ltp = self.get_fresh_price(symbol) or self.get_price(symbol)
+                    if ltp <= 0:
+                        raise
+                    cushion = 1.001 if transaction == self.kite.TRANSACTION_TYPE_BUY else 0.999
+                    limit_price = round(ltp * cushion, 2)
+                    order_id = self.kite.place_order(
+                        variety=self.kite.VARIETY_REGULAR,
+                        tradingsymbol=symbol,
+                        exchange=self.kite.EXCHANGE_NSE,
+                        transaction_type=transaction,
+                        quantity=quantity,
+                        product=self.kite.PRODUCT_MIS,
+                        order_type=self.kite.ORDER_TYPE_LIMIT,
+                        price=limit_price,
+                    )
+                    logger.warning(
+                        f"MARKET rejected for {symbol}; retried as LIMIT @ ₹{limit_price:.2f}"
+                    )
+                else:
+                    raise
+
+            fill_price = self._wait_for_fill_price(order_id)
             logger.info(f"[ZERODHA] {action} {quantity}x {symbol} [{order_type}] → order_id={order_id}")
+            if fill_price > 0:
+                self.ltp_cache[symbol] = fill_price
+                return {"order_id": order_id, "status": "COMPLETED", "price": fill_price}
             return {"order_id": order_id, "status": "PLACED"}
         except Exception as e:
             logger.error(f"place_order failed for {symbol}: {e}")
             return {"error": str(e), "status": "FAILED"}
+
+    def _wait_for_fill_price(self, order_id: str) -> float:
+        """Poll order history briefly to get average fill price for accurate trade logs."""
+        for _ in range(6):
+            try:
+                hist = self.kite.order_history(order_id) or []
+                if not hist:
+                    time.sleep(0.35)
+                    continue
+                last = hist[-1]
+                avg = float(last.get("average_price") or 0)
+                status = str(last.get("status") or "").upper()
+                if avg > 0 and status in {"COMPLETE", "COMPLETED"}:
+                    return avg
+            except Exception:
+                pass
+            time.sleep(0.35)
+        return 0.0
 
     def place_sl_order(self, symbol: str, action: str, quantity: int,
                        trigger_price: float, limit_price: Optional[float] = None) -> dict:
@@ -459,6 +564,14 @@ class ZerodhaBroker(BaseBroker):
                 return token
         raise ValueError(f"Symbol {symbol} not found on NSE")
 
+    def get_feed_status(self) -> dict:
+        return {
+            "source": "zerodha_ws" if self._ws_connected else "zerodha_rest",
+            "connected": self._ws_connected or bool(self._last_rest_success_ts),
+            "last_success_ts": self._last_rest_success_ts,
+            "last_error": self._last_ws_error,
+        }
+
 
 # ─────────────────────────────────────────────────────────────
 # Factory
@@ -471,26 +584,40 @@ def create_broker(
     totp_secret: str = "",
     balance: float = 1_000_000,
 ) -> BaseBroker:
-    if broker_type == "zerodha" and api_key:
-        return ZerodhaBroker(
-            api_key=api_key,
-            api_secret=api_secret,
-            access_token=access_token or None,
-            totp_secret=totp_secret or None,
-        )
-        
-    live_ref = None
-    if api_key and access_token:
-        try:
-            logger.info("Initializing background ZerodhaBroker for precise Paper ticker prices...")
-            live_ref = ZerodhaBroker(
-                api_key=api_key,
-                api_secret=api_secret,
-                access_token=access_token or None,
-                totp_secret=totp_secret or None,
-            )
-        except Exception as e:
-            logger.warning(f"Could not init background Zerodha: {e}")
+    settings = get_settings()
+    # Always fall back to system-wide env-var credentials if user hasn't set their own
+    final_api_key    = api_key    or settings.zerodha_api_key
+    final_api_secret = api_secret or settings.zerodha_api_secret
+    final_totp       = totp_secret or settings.zerodha_totp_secret
 
-    logger.info("Using Paper Broker (simulation mode)")
+    if broker_type == "zerodha" and final_api_key:
+        src = "user-specific" if api_key else "global system env"
+        logger.info(f"[BROKER] Creating ZerodhaBroker using {src} credentials")
+        return ZerodhaBroker(
+            api_key=final_api_key,
+            api_secret=final_api_secret,
+            access_token=access_token or None,
+            totp_secret=final_totp or None,
+        )
+
+    live_ref = None
+    if final_api_key and (access_token or final_totp):
+        try:
+            logger.info("[BROKER] Initializing background ZerodhaBroker for Paper LTP prices...")
+            live_ref = ZerodhaBroker(
+                api_key=final_api_key,
+                api_secret=final_api_secret,
+                access_token=access_token or None,
+                totp_secret=final_totp or None,
+            )
+            if live_ref.is_token_valid():
+                logger.info("[BROKER] ✅ Background Zerodha token valid — Paper will use Zerodha LTP")
+            else:
+                logger.warning("[BROKER] ⚠️ Background Zerodha token INVALID — Paper will use Yahoo fallback")
+                live_ref = None
+        except Exception as e:
+            logger.warning(f"[BROKER] Background Zerodha init failed: {e}")
+            live_ref = None
+
+    logger.info("[BROKER] Using Paper Broker (simulation mode)")
     return PaperBroker(starting_balance=balance, live_broker=live_ref)
