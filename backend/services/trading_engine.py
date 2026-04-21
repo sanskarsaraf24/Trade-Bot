@@ -27,6 +27,7 @@ from services.claude_service import ClaudeService
 from services.risk_manager import RiskManager
 from services.email_service import EmailService
 from services.indicators import calculate_all_indicators, build_narrative, build_macro_narrative
+from services.scanner_service import ScannerService
 from config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -81,6 +82,7 @@ class TradingEngine:
 
         self.risk_manager = RiskManager(config)
         self.email_service = EmailService(to_email=config.alert_email or "")
+        self.scanner = ScannerService(self.broker)
 
         # ── State ───────────────────────────────────────────────
         # open_trades: {symbol: {"trade_id", "entry", "stop_loss", "target", "signal", "qty"}}
@@ -91,6 +93,7 @@ class TradingEngine:
         self.engine_id = str(uuid.uuid4())
         self._monitor_task: Optional[asyncio.Task] = None
         self._last_feed_connected: Optional[bool] = None
+        self._last_scan_time: Optional[datetime] = None
 
         # Restore any open positions from DB so P&L tracking survives restarts
         self._restore_open_trades_from_db()
@@ -174,6 +177,10 @@ class TradingEngine:
                     await self._log("info", "slots_full", f"Max slots ({self.config.max_concurrent_positions}) filled. Tracking open positions only.")
                     signals = []
                 else:
+                    # ── Hourly Market Scan ───────────────────────────────
+                    await self._check_scan_market()
+
+                    # ── Strategy Execution ───────────────────────────────
                     market_data = await self._collect_market_data()
                     if not market_data:
                         await self._log("warning", "no_data", "No market data collected — skipping cycle")
@@ -247,6 +254,34 @@ class TradingEngine:
             self._monitor_task.cancel()
 
     # ─────────────────────────────────────────────────────────
+    async def _check_scan_market(self, force: bool = False):
+        """Perform an hourly scan for top movers and update the watchlist."""
+        now = datetime.now(IST)
+        
+        # Scan if it's the first time, or if 60 minutes have passed, or if forced
+        if force or self._last_scan_time is None or (now - self._last_scan_time).total_seconds() >= 3600:
+            await self._log("info", "market_scanning", "📡 Periodic Markt Scan: Searching for top profit movers...")
+            
+            db = SessionLocal()
+            try:
+                new_symbols = await self.scanner.update_watchlist(db, self.user_id)
+                if new_symbols:
+                    self._last_scan_time = now
+                    # Refresh local config to pick up the new manual_symbols
+                    from database.models import TradingConfiguration
+                    updated_config = db.query(TradingConfiguration).filter(
+                        TradingConfiguration.user_id == self.user_id
+                    ).first()
+                    if updated_config:
+                        self.config = updated_config
+                    
+                    await self._log("info", "watchlist_updated", f"✨ Scanner identified new movers: {', '.join(new_symbols)}")
+            except Exception as e:
+                logger.error(f"Market scan failed: {e}")
+                await self._log("warning", "scan_failed", f"Scanner error: {e}")
+            finally:
+                db.close()
+
     # Data
     # ─────────────────────────────────────────────────────────
     async def _collect_market_data(self) -> dict:

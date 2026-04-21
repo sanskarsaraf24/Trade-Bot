@@ -175,6 +175,27 @@ async def stop_bot(
 
 
 # ─── Status ───────────────────────────────────────────────────
+@router.post("/bot/scan")
+async def scan_market(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Force a market scan to find new movers and update the watchlist."""
+    engine = _get_engine(current_user.id)
+    # Check if the bot is running
+    if not engine.is_running:
+        raise HTTPException(status_code=400, detail="Bot must be running to scan market")
+    
+    # Trigger forced scan
+    await engine._check_scan_market(force=True)
+    
+    return {
+        "success": True,
+        "message": f"Market scan triggered. New movers: {', '.join(engine.config.manual_symbols)}",
+        "new_symbols": engine.config.manual_symbols
+    }
+
+
 @router.get("/bot/status")
 async def bot_status(
     current_user: User = Depends(get_current_user),

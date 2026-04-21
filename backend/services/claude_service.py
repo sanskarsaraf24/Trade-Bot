@@ -122,16 +122,27 @@ JSON FORMAT:
 
     def _parse_response(self, response_text: str, features: dict) -> list[dict]:
         """Parse Claude's JSON response into structured signal dicts."""
+        cleaned = response_text.strip()
         try:
-            # Strip markdown code fences if present
-            cleaned = response_text.strip()
-            # Remove ```json ... ``` or ``` ... ```
-            cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.MULTILINE)
-            cleaned = re.sub(r"\s*```$", "", cleaned, flags=re.MULTILINE)
-            cleaned = cleaned.strip()
+            # --- Robust JSON Extraction ---
+            # Finds the actual JSON object boundaries (first '{' and last '}')
+            start_idx = cleaned.find('{')
+            end_idx = cleaned.rfind('}')
+            
+            if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+                cleaned = cleaned[start_idx:end_idx + 1]
+            else:
+                # Fallback to regex if braces not found (unlikely for valid JSON)
+                cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.MULTILINE)
+                cleaned = re.sub(r"\s*```$", "", cleaned, flags=re.MULTILINE).strip()
 
             data = json.loads(cleaned)
             signals = []
+            
+            if not data:
+                logger.info("Claude returned an empty signals object.")
+                return []
+
             for symbol, signal_data in data.items():
                 if symbol not in features:
                     logger.debug(f"Claude returned signal for unknown symbol {symbol} — skipping")
@@ -147,17 +158,34 @@ JSON FORMAT:
                     "symbol": symbol,
                     "signal": raw_signal,
                     "confidence": confidence,
-                    "reasoning": signal_data.get("reasoning", ""),
+                    "reasoning": signal_data.get("reasoning", "Analysis complete."),
                     "entry_level": entry,
                     "stop_loss": sl,
                     "target": tgt,
                     "risk_reward": signal_data.get("risk_reward", "1:2"),
                 })
 
-            actionable = [s for s in signals if s["signal"] != "HOLD"]
+            actionable = [s for s in signals if s["signal"] not in ("HOLD", "EXIT")]
             logger.info(f"Parsed {len(signals)} signals ({len(actionable)} actionable)")
             return signals
 
-        except (json.JSONDecodeError, KeyError, ValueError) as e:
-            logger.error(f"Failed to parse Claude response: {e}\nRaw (first 500): {response_text[:500]}")
+        except Exception as e:
+            # EMERGENCY LOGGING: Capture the raw response text for debugging
+            # This is surfaced to the user via the dashboard logs.
+            logger.error(f"Failed to parse Claude response: {e}")
+            from database.session import SessionLocal
+            from database.models import SystemLog
+            db = SessionLocal()
+            try:
+                # Create a specific log entry with the raw text
+                db.add(SystemLog(
+                    event_type="raw_ai_response",
+                    message=f"❌ AI PARSE ERROR: {str(e)}\n\nRAW TEXT (first 1000 chars):\n{response_text[:1000]}",
+                    severity="error"
+                ))
+                db.commit()
+            except:
+                db.rollback()
+            finally:
+                db.close()
             return []
