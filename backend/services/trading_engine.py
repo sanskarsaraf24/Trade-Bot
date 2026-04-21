@@ -186,19 +186,25 @@ class TradingEngine:
                     if self.claude and features:
                         try:
                             signals = self.claude.get_signals(features, self.config, len(self.open_trades))
+                            actionable = [s for s in signals if s["signal"] not in ("HOLD", "EXIT")]
                             await self._log(
                                 "info", "signals_received",
-                                f"📊 Claude returned {len(signals)} signals for {len(features)} symbols"
+                                f"🔍 Analyzed {len(features)} symbols | ✅ {len(actionable)} Actionable | ⏸️ {len(signals) - len(actionable)} Hold"
                             )
                         except Exception as e:
                             await self._log("error", "claude_error", f"Claude API error: {e}")
 
                 for signal in signals:
+                    sym = signal.get("symbol", "UNKNOWN")
+                    # Surface HOLD reasoning to the user for transparency
                     if signal["signal"] in ("HOLD", "EXIT"):
+                        reasoning = signal.get("reasoning", "No specific setup found.")
+                        # Only log if it's not a generic placeholder
+                        if len(reasoning) > 5:
+                            await self._log("info", "signal_hold", f"⏸️ {sym} (HOLD): {reasoning}")
                         continue
-                    # BUG FIX: sync count from live open_trades so max_concurrent is enforced
-                    # even within a single signal batch (previously count was stale and allowed
-                    # multiple trades through before update_open_positions was called)
+
+                    # Process actionable signals
                     self.risk_manager.update_open_positions(len(self.open_trades))
                     allowed, reason = self.risk_manager.can_execute(signal)
                     if allowed:
@@ -206,7 +212,7 @@ class TradingEngine:
                     else:
                         await self._log(
                             "warning", "signal_skipped",
-                            f"⚠️ {signal['symbol']} skipped: {reason}"
+                            f"⚠️ {sym} skipped: {reason}"
                         )
 
                 # ── Transparency: Log analysis summary if no trades made ────

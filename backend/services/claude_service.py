@@ -99,11 +99,11 @@ SYMBOLS:
 {symbols_block}
 
 CRITICAL RULES:
-1. TRADING AGAINST THE MACRO TREND: Be very cautious buying if the 7-day trend is down, or selling if the 7-day trend is up.
+1. TREND CONTEXT: Use the 52-week and 7-day trend as guidance, but prioritize the immediate 5m/15m data if a high-probability price-action setup exists (e.g. breakout/reversal).
 2. 52-WEEK LEVELS: Expect support at the 52-week low and resistance at the 52-week high.
-3. LOGICAL REASONING (CoT): For each symbol, first consider the pros and cons of taking a trade.
-4. Risk:Reward must be minimum 1:1.5. Target and SL must be ATR-realistic.
-5. Minimum Confidence: {config.min_confidence_threshold}%
+3. MANDATORY ANALYSIS: You MUST provide an entry for EVERY symbol listed below. If a trade is not high-conviction, mark it as "HOLD". 
+4. CONFIDENCE: If the setup is weak, set confidence < 70%. If internal confidence is below {config.min_confidence_threshold}%, return "HOLD".
+5. Risk:Reward must be minimum 1:1.5. Target and SL must be ATR-realistic.
 6. JSON ONLY: Return ONLY valid JSON.
 
 JSON FORMAT:
@@ -111,8 +111,8 @@ JSON FORMAT:
   "SYMBOL": {{
     "signal": "BUY_STOCK | SELL_STOCK | HOLD",
     "confidence": 0-100,
-    "thought_process": "Write 2-3 sentences analyzing the 15m/Macro trend vs 5m indicators",
-    "reasoning": "Final technical trigger summary",
+    "thought_process": "Mandatory: 2-3 sentences analyzing the 15m/Macro trend vs 5m indicators",
+    "reasoning": "Mandatory: Even for HOLD, explain why (e.g. 'RSI too high', 'No setup', 'Low confidence')",
     "entry_level": <number>,
     "stop_loss": <number>,
     "target": <number>,
