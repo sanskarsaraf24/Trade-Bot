@@ -65,14 +65,30 @@ function ConfigForm() {
   const onSubmit = async (data: any) => {
     setLoading(true)
     try {
-      if (data.manual_symbols_text) {
-        data.manual_symbols = data.manual_symbols_text.split(',').map((s: string) => s.trim().toUpperCase())
+      const payload = { ...data }
+      if (payload.manual_symbols_text) {
+        payload.manual_symbols = payload.manual_symbols_text.split(',').map((s: string) => s.trim().toUpperCase())
       }
-      await configApi.update(data)
+      if (typeof payload.max_daily_loss_percent === 'number' && Number.isFinite(payload.max_daily_loss_percent)) {
+        payload.daily_loss_limit = (Number(payload.account_balance) * payload.max_daily_loss_percent) / 100
+      }
+      if (!Number.isFinite(payload.min_profit_absolute)) payload.min_profit_absolute = null
+      if (!Number.isFinite(payload.min_profit_percent)) payload.min_profit_percent = null
+      if (!payload.broker_api_key) delete payload.broker_api_key
+      if (!payload.broker_api_secret) delete payload.broker_api_secret
+      if (!payload.broker_access_token) delete payload.broker_access_token
+      if (!payload.broker_totp_secret) delete payload.broker_totp_secret
+      delete payload.manual_symbols_text
+      await configApi.update(payload)
       setMessage({ type: 'success', text: 'Configuration saved successfully!' })
       setTimeout(() => setMessage(null), 5000)
-    } catch {
-      setMessage({ type: 'error', text: 'Failed to save configuration.' })
+    } catch (err: any) {
+      const detail =
+        err?.response?.data?.detail ||
+        err?.response?.data?.message ||
+        err?.message ||
+        'Failed to save configuration.'
+      setMessage({ type: 'error', text: typeof detail === 'string' ? detail : 'Failed to save configuration.' })
     } finally {
       setLoading(false)
     }
@@ -83,8 +99,13 @@ function ConfigForm() {
     try {
       const res = await authApi.kiteLogin()
       window.location.href = res.data.login_url
-    } catch {
-      alert('Failed to initialize Zerodha login')
+    } catch (err: any) {
+      const detail =
+        err?.response?.data?.detail ||
+        err?.response?.data?.message ||
+        err?.message ||
+        'Failed to initialize Zerodha login'
+      alert(typeof detail === 'string' ? detail : 'Failed to initialize Zerodha login')
       setLinking(false)
     }
   }

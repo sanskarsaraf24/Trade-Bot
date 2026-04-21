@@ -6,7 +6,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from database.session import get_db
-from database.models import Trade, TradeStatus, User
+from database.models import Trade, TradeStatus, User, ist_now
 from routes.auth import get_current_user
 from routes.bot_routes import _active_engines
 
@@ -96,7 +96,7 @@ async def exit_trade(
         # Bot not running — close in DB directly
         trade.status = TradeStatus.CLOSED
         trade.exit_reason = "MANUAL_EXIT"
-        trade.exit_time = datetime.utcnow()
+        trade.exit_time = ist_now()
         db.commit()
 
     return {"success": True, "trade_id": trade_id, "message": "Trade closed manually"}
@@ -124,12 +124,12 @@ async def exit_all_trades(
     for t in trades:
         t.status = TradeStatus.CLOSED
         t.exit_reason = "MANUAL_EXIT"
-        t.exit_time = datetime.utcnow()
+        t.exit_time = ist_now()
     db.commit()
     return {"success": True, "trades_closed": len(trades), "message": f"Closed {len(trades)} positions"}
 
 
-# ─── Update Trade ─────────────────────────────────────────────
+# ─── Update Trade (DB only — for backward compat) ────────────
 @router.post("/trades/update/{trade_id}")
 async def update_trade(
     trade_id: str,
@@ -137,19 +137,18 @@ async def update_trade(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    """Update trade SL/Target in DB and in-memory. Does NOT touch broker orders."""
     trade = db.query(Trade).filter(
         Trade.id == trade_id,
         Trade.user_id == current_user.id
     ).first()
-    
     if not trade:
         raise HTTPException(status_code=404, detail="Trade not found")
-        
+
     if payload.stop_loss is not None:
         trade.stop_loss = payload.stop_loss
     if payload.target is not None:
         trade.target = payload.target
-        
     db.commit()
 
     # Update engine's in-memory tracking if running
@@ -160,7 +159,86 @@ async def update_trade(
         if payload.target is not None:
             engine.open_trades[trade.symbol]["target"] = payload.target
 
-    return {"success": True, "message": "Trade parameters updated successfully"}
+    return {"success": True, "message": "Trade parameters updated (DB only)"}
+
+
+class BracketModifyRequest(BaseModel):
+    stop_loss: Optional[float] = None
+    target: Optional[float] = None
+
+
+# ─── Modify Bracket Orders (SL + Target on exchange) ─────────
+@router.patch("/trades/bracket/{trade_id}")
+async def modify_bracket_orders(
+    trade_id: str,
+    payload: BracketModifyRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Modify LIVE bracket orders for an open trade.
+    Calls broker.modify_order() on the actual Zerodha SL-M and LIMIT orders,
+    then syncs DB and in-memory state.
+    """
+    trade = db.query(Trade).filter(
+        Trade.id == trade_id,
+        Trade.user_id == current_user.id,
+        Trade.status == TradeStatus.OPEN,
+    ).first()
+    if not trade:
+        raise HTTPException(status_code=404, detail="Open trade not found")
+
+    engine = _active_engines.get(current_user.id)
+    if not engine:
+        raise HTTPException(status_code=400, detail="Bot is not running — cannot modify live orders")
+
+    results = {}
+
+    # ── Modify SL-M order on exchange ──────────────────────────
+    if payload.stop_loss is not None and trade.sl_order_id:
+        result = engine.broker.modify_order(
+            order_id=trade.sl_order_id,
+            trigger_price=round(payload.stop_loss, 2)
+        )
+        results["sl_order"] = result
+        if result.get("status") != "FAILED":
+            trade.stop_loss = payload.stop_loss
+            if trade.symbol in engine.open_trades:
+                engine.open_trades[trade.symbol]["stop_loss"] = payload.stop_loss
+        else:
+            raise HTTPException(status_code=502,
+                detail=f"Failed to modify SL order on exchange: {result.get('error')}")
+
+    # ── Modify Target LIMIT order on exchange ──────────────────
+    if payload.target is not None and trade.target_order_id:
+        result = engine.broker.modify_order(
+            order_id=trade.target_order_id,
+            price=round(payload.target, 2)
+        )
+        results["target_order"] = result
+        if result.get("status") != "FAILED":
+            trade.target = payload.target
+            if trade.symbol in engine.open_trades:
+                engine.open_trades[trade.symbol]["target"] = payload.target
+        else:
+            raise HTTPException(status_code=502,
+                detail=f"Failed to modify target order on exchange: {result.get('error')}")
+
+    # ── Fallback: update DB only if no live order IDs ──────────
+    if payload.stop_loss is not None and not trade.sl_order_id:
+        trade.stop_loss = payload.stop_loss
+        if trade.symbol in engine.open_trades:
+            engine.open_trades[trade.symbol]["stop_loss"] = payload.stop_loss
+        results["sl_note"] = "No live SL order — DB and memory updated only"
+
+    if payload.target is not None and not trade.target_order_id:
+        trade.target = payload.target
+        if trade.symbol in engine.open_trades:
+            engine.open_trades[trade.symbol]["target"] = payload.target
+        results["target_note"] = "No live target order — DB and memory updated only"
+
+    db.commit()
+    return {"success": True, "trade_id": trade_id, "results": results}
 
 
 # ─── Floating P&L (BUG FIX: was missing entirely) ────────────
@@ -181,7 +259,7 @@ async def get_floating_pnl(
     total = 0.0
     for symbol, pos in engine.open_trades.items():
         try:
-            current_price = engine.broker.get_price(symbol)
+            current_price = engine.broker.get_fresh_price(symbol)
             if current_price <= 0:
                 continue
             qty = pos.get("qty", 0)

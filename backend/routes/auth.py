@@ -125,12 +125,12 @@ async def kite_login(
     config = db.query(TradingConfiguration).filter(
         TradingConfiguration.user_id == current_user.id
     ).first()
-    if not config or not config.broker_api_key:
+    api_key = (config.broker_api_key if config else "") or settings.zerodha_api_key
+    if not api_key:
         raise HTTPException(status_code=400, detail="Zerodha API Key missing in config")
 
-    from services.broker_connector import ZerodhaBroker
     # We don't need secret or token yet just to generate the URL
-    login_url = f"https://kite.zerodha.com/connect/login?v=3&api_key={config.broker_api_key}"
+    login_url = f"https://kite.zerodha.com/connect/login?v=3&api_key={api_key}"
     return {"login_url": login_url}
 
 
@@ -146,15 +146,17 @@ async def kite_callback(
     """
     # We assume the first user for simplicity in this single-tenant deployment
     config = db.query(TradingConfiguration).first()
-    if not config or not config.broker_api_key or not config.broker_api_secret:
+    api_key = (config.broker_api_key if config else "") or settings.zerodha_api_key
+    api_secret = (config.broker_api_secret if config else "") or settings.zerodha_api_secret
+    if not config or not api_key or not api_secret:
         # Redirect with error
         return RedirectResponse(url="/config?auth=error&reason=config_missing")
 
     try:
         from services.broker_connector import ZerodhaBroker
         broker = ZerodhaBroker(
-            api_key=config.broker_api_key,
-            api_secret=config.broker_api_secret,
+            api_key=api_key,
+            api_secret=api_secret,
             request_token=request_token
         )
         

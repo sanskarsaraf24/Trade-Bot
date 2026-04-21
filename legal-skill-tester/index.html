@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Claude Legal Skill Laboratory</title>
+    <link rel="stylesheet" href="style.css">
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&family=Playfair+Display:wght@700&display=swap" rel="stylesheet">
+    <!-- CDNs -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/js-yaml/4.1.0/js-yaml.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/4.3.0/marked.min.js"></script>
+    <script src="https://unpkg.com/docx@8.1.0/build/index.js"></script>
+</head>
+<body>
+    <div class="background-glow"></div>
+    
+    <main class="container">
+        <header>
+            <div class="logo">
+                <span class="symbol">⚖️</span>
+                <h1>Legal Skill<span>Lab</span></h1>
+            </div>
+            <p class="subtitle">Test and refine your Claude legal drafting skills in a secure environment.</p>
+        </header>
+
+        <section class="config-grid">
+            <!-- Step 1: Skill Upload -->
+            <div class="card glass" id="skill-card">
+                <div class="card-header">
+                    <span class="step-badge">1</span>
+                    <h3>Legal Skill</h3>
+                </div>
+                <div class="drop-zone" id="drop-zone">
+                    <div class="drop-content">
+                        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12"/>
+                        </svg>
+                        <p>Drop <strong>SKILL.md</strong> or <strong>.zip</strong> here</p>
+                        <span>or click to browse</span>
+                    </div>
+                    <input type="file" id="file-input" hidden accept=".md,.zip">
+                </div>
+                <div id="skill-metadata" class="hidden">
+                    <div class="metadata-info">
+                        <h4 id="skill-name">Unknown Skill</h4>
+                        <p id="skill-desc">Loading metadata...</p>
+                    </div>
+                    <button class="btn-text" id="change-skill">Change Skill</button>
+                </div>
+            </div>
+
+            <!-- Step 2: Connection -->
+            <div class="card glass" id="conn-card">
+                <div class="card-header">
+                    <span class="step-badge">2</span>
+                    <h3>Connection</h3>
+                </div>
+                <div class="input-group">
+                    <label for="api-key">Anthropic API Key</label>
+                    <div class="password-wrapper">
+                        <input type="password" id="api-key" placeholder="sk-ant-...">
+                        <span class="privacy-note">Stored in session only</span>
+                    </div>
+                </div>
+                <div class="input-group">
+                    <label for="model-select">Claude Model</label>
+                    <select id="model-select">
+                        <option value="claude-3-7-sonnet-20250219">Claude 3.7 Sonnet (Latest)</option>
+                        <option value="claude-haiku-4-5-20251001">Claude 4.5 Haiku (Fastest)</option>
+                        <option value="claude-3-5-sonnet-20241022">Claude 3.5 Sonnet</option>
+                        <option value="claude-3-opus-20240229">Claude 3 Opus</option>
+                    </select>
+                </div>
+            </div>
+        </section>
+
+        <!-- Step 3: Request -->
+        <section class="request-panel card glass">
+            <div class="card-header">
+                <span class="step-badge">3</span>
+                <h3>Legal Draft Request</h3>
+            </div>
+            <textarea id="user-prompt" placeholder="Describe the legal draft you need. Examples:
+- Draft a non-compete clause for a senior software engineer in California.
+- Create an NDA for a partnership discussion between two tech startups."></textarea>
+            <div class="panel-actions">
+                <div class="limit-info">Max 1500 words enforced</div>
+                <button id="generate-btn" class="btn-primary" disabled>
+                    <span class="btn-label">Generate Draft</span>
+                    <div class="spinner hidden"></div>
+                </button>
+            </div>
+        </section>
+
+        <!-- Output Section -->
+        <section id="output-section" class="hidden">
+            <div class="output-header">
+                <h3>Draft Preview</h3>
+                <div class="output-actions">
+                    <span id="word-count">0 words</span>
+                    <button id="download-docx" class="btn-secondary">Download .docx</button>
+                    <button id="reset-output" class="btn-text">Clear</button>
+                </div>
+            </div>
+            <div class="card glass output-container">
+                <div id="output-markdown" class="prose"></div>
+            </div>
+        </section>
+    </main>
+
+    <script src="app.js"></script>
+</body>
+</html>

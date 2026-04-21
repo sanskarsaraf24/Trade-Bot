@@ -1,12 +1,13 @@
 from datetime import datetime
+import math
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy.orm import Session
 
 from database.session import get_db
-from database.models import TradingConfiguration, User
+from database.models import TradingConfiguration, User, ist_now
 from routes.auth import get_current_user
 
 router = APIRouter()
@@ -14,9 +15,12 @@ router = APIRouter()
 
 # ─── Pydantic Schemas ─────────────────────────────────────────
 class ConfigRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     account_balance: float = 100000
     daily_profit_target: float = 5000
     daily_loss_limit: float = 3000
+    max_daily_loss_percent: Optional[float] = Field(default=None)
     risk_per_trade_percent: float = 1.0
     risk_appetite: str = "moderate"
 
@@ -54,6 +58,77 @@ class ConfigRequest(BaseModel):
     email_alerts_enabled: bool = True
     alert_email: str = ""
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_dashboard_payload(cls, raw):
+        if not isinstance(raw, dict):
+            return raw
+        data = dict(raw)
+
+        # New dashboard sends percentage-based daily loss control.
+        if data.get("max_daily_loss_percent") is not None:
+            try:
+                bal = float(data.get("account_balance") or 100000)
+                pct = float(data.get("max_daily_loss_percent") or 0)
+                data["daily_loss_limit"] = (bal * pct) / 100.0
+            except Exception:
+                pass
+
+        # Accept manual symbols from comma-separated textbox.
+        if isinstance(data.get("manual_symbols_text"), str) and not data.get("manual_symbols"):
+            parsed = [s.strip().upper() for s in data["manual_symbols_text"].split(",") if s.strip()]
+            data["manual_symbols"] = parsed
+
+        # Backward-compatible broker mode aliases from older UI variants.
+        broker_type = str(data.get("broker_type") or "paper").strip().lower()
+        if broker_type in {"production", "prod", "live"}:
+            broker_type = "zerodha"
+        elif broker_type in {"simulator", "demo"}:
+            broker_type = "paper"
+        data["broker_type"] = broker_type
+
+        for key in ("broker_api_key", "broker_api_secret", "broker_access_token", "broker_totp_secret"):
+            if isinstance(data.get(key), str):
+                data[key] = data[key].strip()
+
+        # Prevent null/NaN from frontend from causing 422/400 on required numbers.
+        numeric_defaults = {
+            "account_balance": 100000,
+            "daily_profit_target": 5000,
+            "daily_loss_limit": 3000,
+            "risk_per_trade_percent": 1.0,
+            "min_confidence_threshold": 65.0,
+            "max_concurrent_positions": 5,
+            "analysis_interval_minutes": 15,
+            "margin_multiplier": 1.0,
+            "default_stop_loss_percent": 0.5,
+            "default_target_percent": 1.0,
+        }
+        for key, default in numeric_defaults.items():
+            val = data.get(key)
+            if val is None:
+                data[key] = default
+                continue
+            try:
+                f = float(val)
+                if math.isnan(f) or math.isinf(f):
+                    data[key] = default
+            except Exception:
+                data[key] = default
+
+        for opt_key in ("min_profit_absolute", "min_profit_percent"):
+            val = data.get(opt_key)
+            if val is None:
+                continue
+            try:
+                f = float(val)
+                if math.isnan(f) or math.isinf(f):
+                    data[opt_key] = None
+            except Exception:
+                data[opt_key] = None
+
+        return data
+
 
 class ConfigResponse(ConfigRequest):
     id: str
@@ -87,6 +162,14 @@ async def save_config(
     db: Session = Depends(get_db),
 ):
     """Save or update trading configuration."""
+    payload = req.model_dump(exclude={"max_daily_loss_percent"})
+    sensitive_fields = {
+        "broker_api_key",
+        "broker_api_secret",
+        "broker_access_token",
+        "broker_totp_secret",
+    }
+
     # Guard rails
     if req.daily_loss_limit > req.account_balance * 0.10:
         raise HTTPException(status_code=400, detail="Daily loss limit cannot exceed 10% of balance")
@@ -100,11 +183,13 @@ async def save_config(
     ).first()
 
     if config:
-        for key, value in req.model_dump().items():
+        for key, value in payload.items():
+            if key in sensitive_fields and value == "":
+                continue
             setattr(config, key, value)
-        config.updated_at = datetime.utcnow()
+        config.updated_at = ist_now()
     else:
-        config = TradingConfiguration(user_id=current_user.id, **req.model_dump())
+        config = TradingConfiguration(user_id=current_user.id, **payload)
         db.add(config)
 
     db.commit()

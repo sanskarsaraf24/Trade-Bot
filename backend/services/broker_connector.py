@@ -20,6 +20,10 @@ class BaseBroker(ABC):
     @abstractmethod
     def get_price(self, symbol: str) -> float: ...
 
+    def get_fresh_price(self, symbol: str) -> float:
+        """Default fresh-price behavior: delegate to get_price()."""
+        return self.get_price(symbol)
+
     @abstractmethod
     def get_ohlcv(self, symbol: str, bars: int, interval: str) -> list[dict]: ...
 
@@ -30,9 +34,40 @@ class BaseBroker(ABC):
     @abstractmethod
     def get_account_balance(self) -> float: ...
 
+    @abstractmethod
+    def get_positions(self) -> list[dict]: ...
+
+    @abstractmethod
+    def get_orders(self) -> list[dict]: ...
+
+    @abstractmethod
+    def cancel_order(self, order_id: str) -> bool: ...
+
+    @abstractmethod
+    def get_symbol_metadata(self, symbol: str) -> dict:
+        """Fetch 52w High/Low and last 7-day trend data."""
+        ...
+
+    @abstractmethod
+    def modify_order(self, order_id: str, price: Optional[float] = None,
+                     trigger_price: Optional[float] = None,
+                     quantity: Optional[int] = None) -> dict:
+        """Modify an open/pending order's price or trigger_price.
+        Used to adjust bracket SL or Target orders after they've been placed."""
+        ...
+
     def subscribe_symbols(self, symbols: list[str]):
         """No-op for brokers that don't use WebSocket streaming."""
         pass
+
+    def get_feed_status(self) -> dict:
+        """Best-effort feed health for dashboard/engine observability."""
+        return {
+            "source": self.__class__.__name__,
+            "connected": True,
+            "last_success_ts": None,
+            "last_error": "",
+        }
 
 
 # ─────────────────────────────────────────────────────────────
@@ -89,6 +124,19 @@ class PaperBroker(BaseBroker):
         self._price_cache: Dict[str, float] = {}
         self._last_fetch: Dict[str, float] = {}
         self._orders: list = []
+        self._feed_status = {
+            "source": "seed",
+            "connected": False,
+            "last_success_ts": None,
+            "last_error": "",
+        }
+
+    def _mark_feed(self, source: str, connected: bool, error: str = ""):
+        self._feed_status["source"] = source
+        self._feed_status["connected"] = connected
+        self._feed_status["last_error"] = error
+        if connected:
+            self._feed_status["last_success_ts"] = datetime.now().isoformat()
 
     def _get_seed_price(self, symbol: str) -> float:
         seed = SEED_PRICES.get(symbol, 500.0)
@@ -99,41 +147,56 @@ class PaperBroker(BaseBroker):
         """Bypass all caching — always call the source (live_broker REST or Yahoo)."""
         if self.live_broker:
             try:
-                return self.live_broker.get_fresh_price(symbol)
-            except Exception:
-                pass
+                live = self.live_broker.get_fresh_price(symbol)
+                if live and live > 0:
+                    self._mark_feed("zerodha_rest", True)
+                    self._price_cache[symbol] = live
+                    self._last_fetch[symbol] = time.time()
+                    return live
+            except Exception as e:
+                self._mark_feed("zerodha_rest", False, str(e))
         # Yahoo fallback for pure paper mode
         live = _fetch_live_price(symbol)
         if live and live > 0:
             self._price_cache[symbol] = live
             self._last_fetch[symbol] = time.time()
+            self._mark_feed("yahoo", True)
             return live
+        self._mark_feed(
+            self._feed_status.get("source") or "seed",
+            False,
+            self._feed_status.get("last_error") or "No live price available"
+        )
         return self._price_cache.get(symbol, self._get_seed_price(symbol))
 
     def get_price(self, symbol: str) -> float:
         now = time.time()
         last = self._last_fetch.get(symbol, 0)
 
-        # Refresh every 10 seconds using Zerodha if available, else 5s Yahoo tick
-        if self.live_broker and (now - last > 10):
+        # Refresh every 2 seconds using Zerodha if available, else 3s Yahoo tick
+        if self.live_broker and (now - last > 2):
             try:
                 live = self.live_broker.get_fresh_price(symbol)
                 if live and live > 0:
                     self._price_cache[symbol] = live
                     self._last_fetch[symbol] = now
+                    self._mark_feed("zerodha_rest", True)
                     return live
-            except Exception:
-                pass
+            except Exception as e:
+                self._mark_feed("zerodha_rest", False, str(e))
 
-        if not self.live_broker and (now - last > 5):
+        if not self.live_broker and (now - last > 3):
             live = _fetch_live_price(symbol)
             if live and live > 0:
                 self._price_cache[symbol] = live * (1 + random.uniform(-0.0005, 0.0005))
+                self._mark_feed("yahoo", True)
             elif symbol not in self._price_cache:
                 self._price_cache[symbol] = self._get_seed_price(symbol)
+                self._mark_feed("seed", False, "Yahoo unavailable")
             else:
                 prev = self._price_cache[symbol]
                 self._price_cache[symbol] = round(prev * (1 + random.uniform(-0.002, 0.002)), 2)
+                self._mark_feed("seed", False, "Using synthetic walk fallback")
             self._last_fetch[symbol] = now
 
         return self._price_cache.get(symbol, self._get_seed_price(symbol))
@@ -198,8 +261,73 @@ class PaperBroker(BaseBroker):
         logger.info(f"[PAPER] {action} {quantity}x {symbol} @ ₹{final_price:,.2f}")
         return {"order_id": order_id, "status": "COMPLETED", "price": final_price}
 
+    def get_symbol_metadata(self, symbol: str) -> dict:
+        """Realistic dummy metadata for paper trading."""
+        current = self.get_price(symbol)
+        return {
+            "52w_high": round(current * 1.3, 2),
+            "52w_low": round(current * 0.7, 2),
+            "7d_avg_volume": random.randint(100_000, 1_000_000),
+            "7d_change_pct": round(random.uniform(-5, 5), 2),
+            "last_day_close": round(current * 0.99, 2)
+        }
+
     def get_account_balance(self) -> float:
         return round(self.balance, 2)
+
+    def get_positions(self) -> list[dict]:
+        """Calculate net positions from simulated order history."""
+        positions = {}
+        for o in self._orders:
+            sym = o["symbol"]
+            qty = o["quantity"]
+            action = o["action"].upper()
+            if action in ("BUY", "BUY_STOCK", "BUY_CALL", "BUY_PUT"):
+                positions[sym] = positions.get(sym, 0) + qty
+            else:
+                positions[sym] = positions.get(sym, 0) - qty
+        
+        net_pos = []
+        for sym, qty in positions.items():
+            if qty != 0:
+                net_pos.append({
+                    "tradingsymbol": sym,
+                    "quantity": qty,
+                    "last_price": self.get_price(sym),
+                    "average_price": self._price_cache.get(sym, 0),
+                    "product": "MIS"
+                })
+        return net_pos
+
+    def get_orders(self) -> list[dict]:
+        return self._orders
+
+    def cancel_order(self, order_id: str) -> bool:
+        for o in self._orders:
+            if o["order_id"] == order_id:
+                o["status"] = "CANCELLED"
+                return True
+        return False
+
+    def modify_order(self, order_id: str, price: Optional[float] = None,
+                     trigger_price: Optional[float] = None,
+                     quantity: Optional[int] = None) -> dict:
+        """Paper: update price/trigger in the simulated order book."""
+        for o in self._orders:
+            if o["order_id"] == order_id:
+                if price is not None:
+                    o["price"] = price
+                if trigger_price is not None:
+                    o["trigger_price"] = trigger_price
+                if quantity is not None:
+                    o["quantity"] = quantity
+                logger.info(f"[PAPER] Modified {order_id}: price={price}, trigger={trigger_price}")
+                return {"order_id": order_id, "status": "MODIFIED"}
+        logger.warning(f"[PAPER] modify_order: order {order_id} not found")
+        return {"error": "Order not found", "status": "FAILED"}
+
+    def get_feed_status(self) -> dict:
+        return dict(self._feed_status)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -215,8 +343,12 @@ class ZerodhaBroker(BaseBroker):
         self.instrument_tokens: Dict[str, int] = {}
         self._all_instruments: list = []
         self.ltp_cache: Dict[str, float] = {}
+        self.metadata_cache: Dict[str, dict] = {}
         self.ticker = None
         self.access_token: Optional[str] = None
+        self._ws_connected: bool = False
+        self._last_ws_error: str = ""
+        self._last_rest_success_ts: str = ""
 
         try:
             from kiteconnect import KiteConnect
@@ -307,12 +439,16 @@ class ZerodhaBroker(BaseBroker):
                                 break
 
             def on_connect(ws, response):
+                self._ws_connected = True
+                self._last_ws_error = ""
                 if self.instrument_tokens:
                     tokens = list(self.instrument_tokens.values())
                     ws.subscribe(tokens)
                     ws.set_mode(ws.MODE_FULL, tokens)
 
             def on_error(ws, code, reason):
+                self._ws_connected = False
+                self._last_ws_error = f"{code}: {reason}"
                 logger.error(f"Kite WebSocket error {code}: {reason}")
 
             self.ticker.on_ticks = on_ticks
@@ -353,6 +489,7 @@ class ZerodhaBroker(BaseBroker):
             if exchange_symbol in data:
                 price = float(data[exchange_symbol]["last_price"])
                 self.ltp_cache[symbol] = price  # keep cache in sync
+                self._last_rest_success_ts = datetime.now().isoformat()
                 logger.info(f"[LTP REST] {symbol} = ₹{price}")
                 return price
         except Exception as e:
@@ -409,23 +546,77 @@ class ZerodhaBroker(BaseBroker):
                 "SL-M":   self.kite.ORDER_TYPE_SLM,
             }
             kite_order_type = _type_map.get(order_type.upper(), self.kite.ORDER_TYPE_MARKET)
+            is_market = kite_order_type == self.kite.ORDER_TYPE_MARKET
 
-            order_id = self.kite.place_order(
-                variety=self.kite.VARIETY_REGULAR,
-                tradingsymbol=symbol,
-                exchange=self.kite.EXCHANGE_NSE,
-                transaction_type=transaction,
-                quantity=quantity,
-                product=self.kite.PRODUCT_MIS,      # MIS = intraday margin (leveraged)
-                order_type=kite_order_type,
-                price=price if order_type in ("LIMIT", "SL") else None,
-                trigger_price=trigger_price if order_type in ("SL", "SL-M") else None,
-            )
+            # Zerodha may reject API MARKET orders without market protection.
+            # First try with market_protection; if still rejected, retry as protective LIMIT.
+            order_kwargs = {
+                "variety": self.kite.VARIETY_REGULAR,
+                "tradingsymbol": symbol,
+                "exchange": self.kite.EXCHANGE_NSE,
+                "transaction_type": transaction,
+                "quantity": quantity,
+                "product": self.kite.PRODUCT_MIS,
+                "order_type": kite_order_type,
+                "price": price if order_type in ("LIMIT", "SL") else None,
+                "trigger_price": trigger_price if order_type in ("SL", "SL-M") else None,
+            }
+            if is_market:
+                order_kwargs["market_protection"] = 2
+
+            try:
+                order_id = self.kite.place_order(**order_kwargs)
+            except Exception as e:
+                err_text = str(e)
+                if is_market and "market protection" in err_text.lower():
+                    ltp = self.get_fresh_price(symbol) or self.get_price(symbol)
+                    if ltp <= 0:
+                        raise
+                    cushion = 1.001 if transaction == self.kite.TRANSACTION_TYPE_BUY else 0.999
+                    limit_price = round(ltp * cushion, 2)
+                    order_id = self.kite.place_order(
+                        variety=self.kite.VARIETY_REGULAR,
+                        tradingsymbol=symbol,
+                        exchange=self.kite.EXCHANGE_NSE,
+                        transaction_type=transaction,
+                        quantity=quantity,
+                        product=self.kite.PRODUCT_MIS,
+                        order_type=self.kite.ORDER_TYPE_LIMIT,
+                        price=limit_price,
+                    )
+                    logger.warning(
+                        f"MARKET rejected for {symbol}; retried as LIMIT @ ₹{limit_price:.2f}"
+                    )
+                else:
+                    raise
+
+            fill_price = self._wait_for_fill_price(order_id)
             logger.info(f"[ZERODHA] {action} {quantity}x {symbol} [{order_type}] → order_id={order_id}")
+            if fill_price > 0:
+                self.ltp_cache[symbol] = fill_price
+                return {"order_id": order_id, "status": "COMPLETED", "price": fill_price}
             return {"order_id": order_id, "status": "PLACED"}
         except Exception as e:
             logger.error(f"place_order failed for {symbol}: {e}")
             return {"error": str(e), "status": "FAILED"}
+
+    def _wait_for_fill_price(self, order_id: str) -> float:
+        """Poll order history briefly to get average fill price for accurate trade logs."""
+        for _ in range(6):
+            try:
+                hist = self.kite.order_history(order_id) or []
+                if not hist:
+                    time.sleep(0.35)
+                    continue
+                last = hist[-1]
+                avg = float(last.get("average_price") or 0)
+                status = str(last.get("status") or "").upper()
+                if avg > 0 and status in {"COMPLETE", "COMPLETED"}:
+                    return avg
+            except Exception:
+                pass
+            time.sleep(0.35)
+        return 0.0
 
     def place_sl_order(self, symbol: str, action: str, quantity: int,
                        trigger_price: float, limit_price: Optional[float] = None) -> dict:
@@ -439,6 +630,50 @@ class ZerodhaBroker(BaseBroker):
                                 order_type=order_type,
                                 price=limit_price,
                                 trigger_price=trigger_price)
+
+    def get_positions(self) -> list[dict]:
+        try:
+            return self.kite.positions().get("net", [])
+        except Exception as e:
+            logger.error(f"Zerodha: failed to get positions: {e}")
+            return []
+
+    def get_orders(self) -> list[dict]:
+        try:
+            return self.kite.orders()
+        except Exception as e:
+            logger.error(f"Zerodha: failed to get orders: {e}")
+            return []
+
+    def cancel_order(self, order_id: str) -> bool:
+        try:
+            self.kite.cancel_order(variety=self.kite.VARIETY_REGULAR, order_id=order_id)
+            return True
+        except Exception as e:
+            logger.error(f"Zerodha: failed to cancel order {order_id}: {e}")
+            return False
+
+    def modify_order(self, order_id: str, price: Optional[float] = None,
+                     trigger_price: Optional[float] = None,
+                     quantity: Optional[int] = None) -> dict:
+        """Modify a live order's price or trigger on Zerodha.
+        Used to dynamically adjust SL-M trigger price or LIMIT target price."""
+        if not self.access_token:
+            return {"error": "No valid session token", "status": "FAILED"}
+        try:
+            kwargs = {"variety": self.kite.VARIETY_REGULAR, "order_id": order_id}
+            if price is not None:
+                kwargs["price"] = price
+            if trigger_price is not None:
+                kwargs["trigger_price"] = trigger_price
+            if quantity is not None:
+                kwargs["quantity"] = quantity
+            self.kite.modify_order(**kwargs)
+            logger.info(f"[ZERODHA] Modified order {order_id}: price={price}, trigger={trigger_price}")
+            return {"order_id": order_id, "status": "MODIFIED"}
+        except Exception as e:
+            logger.error(f"Zerodha: failed to modify order {order_id}: {e}")
+            return {"error": str(e), "status": "FAILED"}
 
     def get_account_balance(self) -> float:
         try:
@@ -458,6 +693,50 @@ class ZerodhaBroker(BaseBroker):
                 self.instrument_tokens[symbol] = token
                 return token
         raise ValueError(f"Symbol {symbol} not found on NSE")
+
+    def get_symbol_metadata(self, symbol: str) -> dict:
+        """
+        Fetch 52-week High/Low and 7-day average volume from daily candles.
+        Cached per broker instance (usually once per engine session).
+        """
+        if symbol in self.metadata_cache:
+            return self.metadata_cache[symbol]
+
+        from datetime import date, timedelta
+        to_date = date.today()
+        from_date = to_date - timedelta(days=400)
+        try:
+            token = self._get_instrument_token(symbol)
+            data = self.kite.historical_data(token, from_date, to_date, "day")
+            if not data: return {}
+            highs = [d["high"] for d in data]
+            lows = [d["low"] for d in data]
+            recent_data = data[-7:]
+            p_start = recent_data[0]["close"]
+            p_end = recent_data[-1]["close"]
+            change_7d = ((p_end - p_start) / p_start) * 100 if p_start else 0
+            avg_vol_7d = sum(d["volume"] for d in recent_data) / len(recent_data)
+            
+            metadata = {
+                "52w_high": round(max(highs), 2),
+                "52w_low": round(min(lows), 2),
+                "7d_avg_volume": round(avg_vol_7d, 0),
+                "7d_change_pct": round(change_7d, 2),
+                "last_day_close": recent_data[-1]["close"]
+            }
+            self.metadata_cache[symbol] = metadata
+            return metadata
+        except Exception as e:
+            logger.error(f"Failed to fetch metadata for {symbol}: {e}")
+            return {}
+
+    def get_feed_status(self) -> dict:
+        return {
+            "source": "zerodha_ws" if self._ws_connected else "zerodha_rest",
+            "connected": self._ws_connected or bool(self._last_rest_success_ts),
+            "last_success_ts": self._last_rest_success_ts,
+            "last_error": self._last_ws_error,
+        }
 
 
 # ─────────────────────────────────────────────────────────────
@@ -480,7 +759,7 @@ def create_broker(
         )
         
     live_ref = None
-    if api_key and access_token:
+    if api_key and (access_token or totp_secret):
         try:
             logger.info("Initializing background ZerodhaBroker for precise Paper ticker prices...")
             live_ref = ZerodhaBroker(
@@ -489,6 +768,9 @@ def create_broker(
                 access_token=access_token or None,
                 totp_secret=totp_secret or None,
             )
+            if not live_ref.is_token_valid():
+                logger.warning("Background Zerodha token invalid; paper mode will use Yahoo/seed fallback.")
+                live_ref = None
         except Exception as e:
             logger.warning(f"Could not init background Zerodha: {e}")
 

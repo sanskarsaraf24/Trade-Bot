@@ -64,11 +64,9 @@ export default function Dashboard() {
     const floatInterval = setInterval(async () => {
       try {
         const { data } = await tradesApi.floatingPnl()
-        if (data?.positions?.length) {
-          const map: Record<string, {current_price: number, floating_pnl: number}> = {}
-          data.positions.forEach((p: any) => { map[p.symbol] = { current_price: p.current_price, floating_pnl: p.floating_pnl } })
-          setFloatingPositions(map)
-        }
+        const map: Record<string, {current_price: number, floating_pnl: number}> = {}
+        ;(data?.positions || []).forEach((p: any) => { map[p.symbol] = { current_price: p.current_price, floating_pnl: p.floating_pnl } })
+        setFloatingPositions(map)
       } catch {}
     }, 15_000)
     return () => { clearInterval(interval); clearInterval(floatInterval) }
@@ -93,13 +91,11 @@ export default function Dashboard() {
         lastUpdate: data.last_update as string,
       })
       // Capture live prices + floating P&L from engine's WS broadcast
-      if (data.open_positions_detail) {
-        const map: Record<string, {current_price: number, floating_pnl: number}> = {}
-        ;(data.open_positions_detail as any[]).forEach((p) => {
-          map[p.symbol] = { current_price: p.current_price, floating_pnl: p.floating_pnl }
-        })
-        setFloatingPositions(map)
-      }
+      const map: Record<string, {current_price: number, floating_pnl: number}> = {}
+      ;((data.open_positions_detail as any[]) || []).forEach((p) => {
+        map[p.symbol] = { current_price: p.current_price, floating_pnl: p.floating_pnl }
+      })
+      setFloatingPositions(map)
       metricsApi.daily().then((r) => setDailyMetrics(r.data))
     },
     onLogEvent: (data) => addLog(data as any),

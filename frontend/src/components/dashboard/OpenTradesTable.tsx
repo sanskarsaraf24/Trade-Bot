@@ -1,6 +1,6 @@
 'use client'
 import { tradesApi } from '@/lib/api'
-import { X, Edit2, Check, TrendingUp, TrendingDown, Target, Activity } from 'lucide-react'
+import { X, Edit2, Check, TrendingUp, TrendingDown, Target, Activity, Info } from 'lucide-react'
 import clsx from 'clsx'
 
 interface Trade {
@@ -15,10 +15,71 @@ interface Trade {
   quantity: number
   confidence: number
   claude_reasoning: string
+  thought_process?: string
   entry_time: string
 }
 
 import { useState } from 'react'
+
+function OpenTradeReasoningModal({ trade, onClose }: { trade: Trade; onClose: () => void }) {
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm"
+      onClick={onClose}
+    >
+      <div
+        className="relative bg-white rounded-2xl shadow-2xl max-w-md w-full mx-4 p-6 border border-slate-100"
+        onClick={e => e.stopPropagation()}
+      >
+        <div className="flex items-start justify-between mb-4">
+          <div>
+            <div className="flex items-center gap-2 mb-1">
+              <span className={clsx('chip', trade.signal.includes('BUY') ? 'chip-profit' : 'chip-loss')}>
+                {trade.signal.replace('_STOCK', '').replace('_', ' ')}
+              </span>
+              <span className="font-black text-slate-900 text-base tracking-tight">{trade.symbol}</span>
+              <span className="text-[9px] font-bold uppercase tracking-widest text-indigo-400 bg-indigo-50 rounded-full px-2 py-0.5">Live</span>
+            </div>
+            <p className="text-[10px] font-bold uppercase tracking-widest text-slate-400">AI Trade Thesis</p>
+          </div>
+          <button onClick={onClose} className="p-1.5 rounded-lg text-slate-300 hover:text-slate-600 hover:bg-slate-100 transition-all">
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+
+        {trade.thought_process && (
+          <div className="bg-amber-50 border border-amber-100 rounded-xl p-4 mb-3">
+            <p className="text-[9px] font-bold uppercase tracking-widest text-amber-500 mb-2">AI Thought Process</p>
+            <p className="text-xs font-medium text-slate-700 leading-relaxed">{trade.thought_process}</p>
+          </div>
+        )}
+
+        <div className="bg-indigo-50 border border-indigo-100 rounded-xl p-4 mb-4">
+          <p className="text-[9px] font-bold uppercase tracking-widest text-indigo-500 mb-2">Final Reasoning</p>
+          <p className="text-xs font-medium text-slate-700 leading-relaxed">
+            {trade.claude_reasoning || 'No reasoning recorded.'}
+          </p>
+        </div>
+
+        <div className="grid grid-cols-3 gap-3 text-center">
+          <div className="bg-slate-50 rounded-xl p-2">
+            <p className="text-[9px] font-bold uppercase tracking-widest text-slate-400 mb-1">Entry</p>
+            <p className="text-xs font-black text-slate-900">₹{trade.entry_price?.toLocaleString()}</p>
+          </div>
+          <div className="bg-slate-50 rounded-xl p-2">
+            <p className="text-[9px] font-bold uppercase tracking-widest text-slate-400 mb-1">Confidence</p>
+            <p className="text-xs font-black text-indigo-600">{trade.confidence?.toFixed(0)}%</p>
+          </div>
+          <div className="bg-slate-50 rounded-xl p-2">
+            <p className="text-[9px] font-bold uppercase tracking-widest text-slate-400 mb-1">Qty</p>
+            <p className="text-xs font-black text-slate-900">{trade.quantity}</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function ProgressBar({ tradeId, entry, current, sl: initialSl, target: initialTarget, signal, onUpdate }: {
   tradeId: string; entry: number; current: number; sl: number; target: number; signal: string; onUpdate: () => void;
 }) {
@@ -30,10 +91,22 @@ function ProgressBar({ tradeId, entry, current, sl: initialSl, target: initialTa
   const handleSave = async () => {
     setUpdating(true);
     try {
-      await tradesApi.updateTrade(tradeId, { stop_loss: sl, target });
+      // Try to modify live bracket orders on the exchange first.
+      // Falls back to DB-only update if bot isn't running (modifyBracket returns 400).
+      try {
+        await tradesApi.modifyBracket(tradeId, { stop_loss: sl, target });
+      } catch (bracketErr: unknown) {
+        const status = (bracketErr as { response?: { status?: number } })?.response?.status;
+        if (status === 400 || status === 400) {
+          // Bot not running — update DB only
+          await tradesApi.updateTrade(tradeId, { stop_loss: sl, target });
+        } else {
+          throw bracketErr;
+        }
+      }
       setIsEditing(false);
       onUpdate();
-    } catch { alert('Failed to update') }
+    } catch { alert('Failed to update SL/Target') }
     setUpdating(false);
   };
 
@@ -96,6 +169,7 @@ export default function OpenTradesTable({
   onExit: () => void
 }) {
   const typed = trades as Trade[]
+  const [activeTrade, setActiveTrade] = useState<Trade | null>(null)
 
   if (!typed.length) {
     return (
@@ -115,13 +189,15 @@ export default function OpenTradesTable({
   }
 
   const duration = (entryTime: string) => {
-    const mins = Math.floor((Date.now() - new Date(entryTime + (entryTime.endsWith('Z') ? '' : 'Z')).getTime()) / 60000)
+    const mins = Math.floor((Date.now() - new Date(entryTime).getTime()) / 60000)
     if (mins < 60) return `${mins}m`
     return `${Math.floor(mins / 60)}h ${mins % 60}m`
   }
 
   return (
-    <div className="max-h-96 overflow-y-auto overflow-x-auto border-b border-slate-100 scrollbar-thin relative">
+    <>
+      {activeTrade && <OpenTradeReasoningModal trade={activeTrade} onClose={() => setActiveTrade(null)} />}
+      <div className="max-h-96 overflow-y-auto overflow-x-auto border-b border-slate-100 scrollbar-thin relative">
       <table className="data-table">
         <thead className="sticky top-0 bg-white shadow-sm z-10">
           <tr>
@@ -199,13 +275,22 @@ export default function OpenTradesTable({
                 {duration(trade.entry_time)}
               </td>
               <td className="text-right py-5 pr-0">
-                <button
-                  onClick={() => handleExit(trade.id, trade.symbol)}
-                  className="p-2 rounded-xl text-slate-300 hover:text-rose-600 hover:bg-rose-50 transition-all duration-200 shadow-xs border border-transparent hover:border-rose-100"
-                  title="Force Close Position"
-                >
-                  <X className="w-4 h-4" />
-                </button>
+                <div className="flex items-center justify-end gap-1">
+                  <button
+                    onClick={() => setActiveTrade(trade)}
+                    title="View AI Reasoning"
+                    className="p-1.5 rounded-xl text-slate-300 hover:text-indigo-600 hover:bg-indigo-50 transition-all duration-200 border border-transparent hover:border-indigo-100"
+                  >
+                    <Info className="w-3.5 h-3.5" />
+                  </button>
+                  <button
+                    onClick={() => handleExit(trade.id, trade.symbol)}
+                    className="p-2 rounded-xl text-slate-300 hover:text-rose-600 hover:bg-rose-50 transition-all duration-200 shadow-xs border border-transparent hover:border-rose-100"
+                    title="Force Close Position"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
               </td>
             </tr>
             )
@@ -213,5 +298,6 @@ export default function OpenTradesTable({
         </tbody>
       </table>
     </div>
+    </>
   )
 }

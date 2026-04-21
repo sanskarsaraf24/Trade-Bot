@@ -26,7 +26,7 @@ from services.broker_connector import create_broker
 from services.claude_service import ClaudeService
 from services.risk_manager import RiskManager
 from services.email_service import EmailService
-from services.indicators import calculate_all_indicators, build_narrative
+from services.indicators import calculate_all_indicators, build_narrative, build_macro_narrative
 from config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -90,6 +90,7 @@ class TradingEngine:
         self.last_update: Optional[str] = None
         self.engine_id = str(uuid.uuid4())
         self._monitor_task: Optional[asyncio.Task] = None
+        self._last_feed_connected: Optional[bool] = None
 
         # Restore any open positions from DB so P&L tracking survives restarts
         self._restore_open_trades_from_db()
@@ -160,7 +161,15 @@ class TradingEngine:
 
                 await self._log("info", "cycle_start", "🔄 Analysis cycle started")
 
-                # ── Strategy cycle ─────────────────────────────
+                # ── Sync balance and risk rules ────────────────
+                try:
+                    real_balance = self.broker.get_account_balance()
+                    if real_balance > 0:
+                        self.risk_manager.update_available_balance(real_balance)
+                        logger.info(f"Synced broker balance: ₹{real_balance:,.2f}")
+                except Exception as e:
+                    logger.warning(f"Failed to sync broker balance: {e}")
+
                 if len(self.open_trades) >= self.config.max_concurrent_positions:
                     await self._log("info", "slots_full", f"Max slots ({self.config.max_concurrent_positions}) filled. Tracking open positions only.")
                     signals = []
@@ -200,6 +209,13 @@ class TradingEngine:
                             f"⚠️ {signal['symbol']} skipped: {reason}"
                         )
 
+                # ── Transparency: Log analysis summary if no trades made ────
+                if signals and not any(s["signal"] not in ("HOLD", "EXIT") for s in signals):
+                    summary = []
+                    for s in signals[:3]: # top 3 symbols for brevity
+                        summary.append(f"{s['symbol']}: {s['signal']} ({s['confidence']:.0f}%)")
+                    await self._log("info", "no_actionable_signals", f"No actionable signals found. Top reasons: {', '.join(summary)}...")
+
                 # Update metrics after cycle
                 await self._refresh_daily_pnl()
                 self.last_update = datetime.now(IST).isoformat()
@@ -234,10 +250,13 @@ class TradingEngine:
             try:
                 candles = self.broker.get_ohlcv(symbol, bars=100, interval="5minute")
                 current_price = self.broker.get_price(symbol)
+                metadata = self.broker.get_symbol_metadata(symbol)
+                
                 if candles and current_price > 0:
                     market_data[symbol] = {
                         "candles": candles,
                         "current_price": current_price,
+                        "metadata": metadata,
                     }
                     logger.debug(f"Fetched {len(candles)} candles for {symbol} @ ₹{current_price}")
             except Exception as e:
@@ -250,12 +269,18 @@ class TradingEngine:
             try:
                 candles = data["candles"]
                 price = data["current_price"]
+                metadata = data.get("metadata", {})
+                
                 indicators = calculate_all_indicators(candles)
                 narrative = build_narrative(symbol, price, indicators)
+                macro_narrative = build_macro_narrative(metadata, price)
+                
                 features[symbol] = {
                     "current_price": price,
                     "indicators": indicators,
                     "narrative": narrative,
+                    "macro_context": metadata,
+                    "macro_narrative": macro_narrative,
                 }
             except Exception as e:
                 logger.warning(f"Feature engineering failed for {symbol}: {e}")
@@ -286,17 +311,16 @@ class TradingEngine:
         ai_qty = signal.get("suggested_quantity")
         if ai_qty and isinstance(ai_qty, (int, float)) and ai_qty > 0:
             qty = min(int(ai_qty), max_qty)
-            await self._log("info", "ai_quantity_used", f"{symbol}: using AI suggested quantity {qty} (max allowed {max_qty})")
         else:
             qty = max_qty
-            
+
         if qty <= 0:
             await self._log("warning", "bad_qty", f"{symbol}: calculated qty=0 — skipping")
             return
 
         # ── Minimum profit check (covers brokerage) ───────────
         expected_profit = abs(tgt - entry) * qty
-        min_abs = getattr(self.config, "min_profit_absolute", None)
+        min_abs = getattr(self.config, "min_profit_absolute", 50.0) or 50.0
         min_pct = getattr(self.config, "min_profit_percent", None)
         expected_pct = (expected_profit / (entry * qty)) * 100 if entry and qty else 0
         if min_abs and expected_profit < min_abs:
@@ -308,20 +332,59 @@ class TradingEngine:
                 f"⚠️ {symbol}: expected profit {expected_pct:.2f}% < min {min_pct:.2f}% — skipping")
             return
 
-        # Fetch a FRESH price from Zerodha REST right before execution — bypasses all caches
-        # This is the single source of truth for what the market is trading at right now
+        # ── Fetch fresh price just before execution ────────────
         execution_ltp = self.broker.get_fresh_price(symbol)
-        logger.info(f"[EXEC] Pre-trade LTP for {symbol}: ₹{execution_ltp} (Claude suggested: ₹{entry})")
+        logger.info(f"[EXEC] Pre-trade LTP for {symbol}: ₹{execution_ltp} (Claude: ₹{entry})")
 
-        # Place order — use MIS for intraday margin leverage
-        # NOTE: For MARKET orders, we do NOT pass the 'entry' price to the broker
+        # ── Step 1: Place main entry MARKET order ─────────────
         order = self.broker.place_order(symbol, signal["signal"], qty, "MARKET")
         if order.get("status") == "FAILED":
             await self._log("error", "order_failed", f"❌ Order failed for {symbol}: {order.get('error')}")
             return
 
-        # Persist to DB — use ACTUAL fill price from broker, or our fresh pre-trade LTP
         actual_fill_price = order.get("price") or execution_ltp or entry
+        is_buy = "BUY" in signal["signal"]
+        exit_action = "SELL" if is_buy else "BUY"
+
+        # ── Step 2: Place SL-M order (stop loss protection) ───
+        # SL-M triggers at market price when stop_loss level is breached
+        sl_order_id = ""
+        try:
+            sl_order = self.broker.place_order(
+                symbol, exit_action, qty,
+                order_type="SL-M",
+                trigger_price=round(sl, 2)
+            )
+            if sl_order.get("status") != "FAILED":
+                sl_order_id = sl_order.get("order_id", "")
+                await self._log("info", "sl_order_placed",
+                    f"🛡️ SL-M order placed for {symbol}: trigger ₹{sl:.2f} | order_id={sl_order_id}")
+            else:
+                await self._log("warning", "sl_order_failed",
+                    f"⚠️ SL-M order FAILED for {symbol}: {sl_order.get('error')} — monitoring via price poll")
+        except Exception as e:
+            await self._log("warning", "sl_order_error", f"SL order error for {symbol}: {e}")
+
+        # ── Step 3: Place LIMIT target order (profit booking) ─
+        # LIMIT order at target price — auto-executes when market reaches target
+        target_order_id = ""
+        try:
+            tgt_order = self.broker.place_order(
+                symbol, exit_action, qty,
+                order_type="LIMIT",
+                price=round(tgt, 2)
+            )
+            if tgt_order.get("status") != "FAILED":
+                target_order_id = tgt_order.get("order_id", "")
+                await self._log("info", "target_order_placed",
+                    f"🎯 LIMIT target order placed for {symbol}: ₹{tgt:.2f} | order_id={target_order_id}")
+            else:
+                await self._log("warning", "target_order_failed",
+                    f"⚠️ Target order FAILED for {symbol}: {tgt_order.get('error')} — monitoring via price poll")
+        except Exception as e:
+            await self._log("warning", "target_order_error", f"Target order error for {symbol}: {e}")
+
+        # ── Step 4: Persist to DB with both order IDs ─────────
         db = SessionLocal()
         try:
             trade = Trade(
@@ -336,6 +399,8 @@ class TradingEngine:
                 confidence=signal["confidence"],
                 claude_reasoning=signal.get("reasoning", ""),
                 main_order_id=order.get("order_id", ""),
+                sl_order_id=sl_order_id,
+                target_order_id=target_order_id,
                 status=TradeStatus.OPEN,
             )
             db.add(trade)
@@ -350,6 +415,8 @@ class TradingEngine:
                 "signal": signal["signal"],
                 "qty": qty,
                 "symbol": symbol,
+                "sl_order_id": sl_order_id,
+                "target_order_id": target_order_id,
             }
         finally:
             db.close()
@@ -358,8 +425,10 @@ class TradingEngine:
 
         await self._log(
             "info", "trade_opened",
-            f"🟢 OPENED {signal['signal']} {symbol} @ ₹{actual_fill_price:.2f} (Claude: ₹{entry:.2f}) | "
-            f"SL ₹{sl:.2f} | Target ₹{tgt:.2f} | Qty {qty} | Conf {signal['confidence']:.0f}%"
+            f"🟢 OPENED {signal['signal']} {symbol} @ ₹{actual_fill_price:.2f} "
+            f"| SL ₹{sl:.2f} (order:{sl_order_id or 'price-poll'}) "
+            f"| Target ₹{tgt:.2f} (order:{target_order_id or 'price-poll'}) "
+            f"| Qty {qty} | Conf {signal['confidence']:.0f}%"
         )
         await self.email_service.trade_opened(symbol, signal["signal"], actual_fill_price, signal["confidence"])
         await _get_ws_manager().send_to_user(self.user_id, {
@@ -369,28 +438,44 @@ class TradingEngine:
                 "symbol": symbol,
                 "signal": signal["signal"],
                 "entry": actual_fill_price,
+                "sl": sl,
+                "target": tgt,
                 "qty": qty,
             },
             "timestamp": datetime.now(IST).isoformat(),
         })
 
     async def exit_trade(self, trade_id: str, reason: str = "MANUAL_EXIT", exit_price: float = 0):
-        """Exit a single trade by trade_id."""
+        """Exit a single trade by trade_id. Cancels any open bracket orders first."""
         db = SessionLocal()
         try:
             trade = db.query(Trade).filter(Trade.id == trade_id).first()
             if not trade or trade.status != TradeStatus.OPEN:
                 return
 
+            # ── Cancel remaining bracket orders before placing exit ──
+            # This prevents orphan orders lingering on the exchange.
+            for oid_attr, label in (("sl_order_id", "SL-M"), ("target_order_id", "Target")):
+                oid = getattr(trade, oid_attr, "") or ""
+                if oid:
+                    cancelled = self.broker.cancel_order(oid)
+                    if cancelled:
+                        logger.info(f"[❌ CANCELLED] {label} order {oid} for {trade.symbol}")
+                    else:
+                        logger.warning(f"Could not cancel {label} order {oid} — may already be filled/cancelled")
+
             if exit_price <= 0:
-                exit_price = self.broker.get_price(trade.symbol)
+                exit_price = self.broker.get_fresh_price(trade.symbol)
             if exit_price <= 0:
                 exit_price = trade.entry_price  # last resort fallback
 
-            # Place exit order and use actual fill price for P&L calculation
-            opp = "SELL" if "BUY" in trade.signal.value else "BUY"
-            exit_order = self.broker.place_order(trade.symbol, opp, trade.quantity, "MARKET")
-            actual_exit_price = exit_order.get("price") or exit_price
+            # Place market exit order only if reason is not a native broker fill
+            # (SL_HIT and TARGET_HIT via order polling mean broker already filled the order)
+            actual_exit_price = exit_price
+            if reason not in ("SL_HIT_BROKER", "TARGET_HIT_BROKER"):
+                opp = "SELL" if "BUY" in trade.signal.value else "BUY"
+                exit_order = self.broker.place_order(trade.symbol, opp, trade.quantity, "MARKET")
+                actual_exit_price = exit_order.get("price") or exit_price
 
             pnl = self._calc_pnl(trade.signal, trade.entry_price, actual_exit_price, trade.quantity)
             trade.exit_price = actual_exit_price
@@ -399,20 +484,22 @@ class TradingEngine:
             trade.status = TradeStatus.CLOSED
             trade.pnl = pnl
             trade.pnl_percent = (pnl / (trade.entry_price * trade.quantity)) * 100 if trade.entry_price else 0
+            # Clear broker order IDs so monitoring loop doesn't try to cancel them again
+            trade.sl_order_id = ""
+            trade.target_order_id = ""
             db.commit()
 
             self.open_trades.pop(trade.symbol, None)
             self.risk_manager.update_open_positions(len(self.open_trades))
 
-            # Refresh daily PnL so risk limits stay accurate
             await self._refresh_daily_pnl()
 
             emoji = "🟢" if pnl >= 0 else "🔴"
             await self._log(
                 "info", "trade_closed",
-                f"{emoji} CLOSED {trade.symbol} [{reason}] @ ₹{exit_price:.2f} | P&L ₹{pnl:+.2f}"
+                f"{emoji} CLOSED {trade.symbol} [{reason}] @ ₹{actual_exit_price:.2f} | P&L ₹{pnl:+.2f}"
             )
-            await self.email_service.trade_closed(trade.symbol, trade.signal.value, exit_price, pnl, reason)
+            await self.email_service.trade_closed(trade.symbol, trade.signal.value, actual_exit_price, pnl, reason)
 
         finally:
             db.close()
@@ -435,18 +522,24 @@ class TradingEngine:
     # Monitoring loop (runs every 5 seconds)
     # ─────────────────────────────────────────────────────────
     async def _run_monitoring_loop(self):
-        """Check SL/Target hits continuously."""
+        """Check SL/Target hits and adjust bracket orders continuously."""
         _metrics_tick = 0
+        _bracket_tick = 0
         while self.is_running:
             try:
                 if not self.is_paused and self._is_market_open():
                     await self._check_sl_target()
-                    # BUG FIX: broadcast floating P&L every 30s (6 × 5s ticks)
-                    # Previously metrics only broadcast after a full strategy cycle (5+ min)
                     _metrics_tick += 1
-                    if _metrics_tick >= 6 and self.open_trades:
+                    _bracket_tick += 1
+                    # Broadcast heartbeat metrics every 30s even without positions
+                    if _metrics_tick >= 6:
+                        self.last_update = datetime.now(IST).isoformat()
                         await self._broadcast_metrics()
                         _metrics_tick = 0
+                    # Adjust trailing stops every 60s (12 ticks × 5s)
+                    if _bracket_tick >= 12:
+                        await self._adjust_bracket_orders()
+                        _bracket_tick = 0
                 await asyncio.sleep(5)
             except asyncio.CancelledError:
                 break
@@ -455,29 +548,152 @@ class TradingEngine:
                 await asyncio.sleep(10)
 
     async def _check_sl_target(self):
+        """
+        Dual-mode SL/Target detection:
+        1. PRIMARY: Poll Zerodha order statuses — catches broker-native fills (most reliable)
+        2. FALLBACK: Price polling — activates if broker orders weren't placed (paper mode, errors)
+        """
+        # Build a quick lookup of all current order statuses (single API call for efficiency)
+        order_status_map: dict[str, str] = {}
+        fill_price_map: dict[str, float] = {}
+        try:
+            all_orders = self.broker.get_orders()
+            for o in all_orders:
+                oid = str(o.get("order_id", "") or "")
+                status = str(o.get("status", "") or "").upper()
+                avg_price = float(o.get("average_price") or 0)
+                if oid:
+                    order_status_map[oid] = status
+                    if avg_price > 0:
+                        fill_price_map[oid] = avg_price
+        except Exception as e:
+            logger.warning(f"Could not fetch order book: {e}")
+
         for symbol, pos in list(self.open_trades.items()):
             try:
+                sl_oid = pos.get("sl_order_id", "")
+                tgt_oid = pos.get("target_order_id", "")
+                handled = False
+
+                # ── PRIMARY: Check if SL order has been filled by broker ──
+                if sl_oid and order_status_map.get(sl_oid) in ("COMPLETE", "COMPLETED"):
+                    fill_px = fill_price_map.get(sl_oid, 0)
+                    await self._log("info", "sl_hit_broker",
+                        f"🔴 SL order {sl_oid} FILLED for {symbol} @ ₹{fill_px:.2f} (broker-native)")
+                    # Cancel the target order before recording the exit
+                    if tgt_oid:
+                        self.broker.cancel_order(tgt_oid)
+                        logger.info(f"[❌] Cancelled target order {tgt_oid} after SL hit")
+                    pos["sl_order_id"] = ""  # clear to avoid re-processing
+                    pos["target_order_id"] = ""
+                    await self.exit_trade(pos["trade_id"], "SL_HIT_BROKER", fill_px)
+                    handled = True
+
+                # ── PRIMARY: Check if Target order has been filled by broker ──
+                elif tgt_oid and order_status_map.get(tgt_oid) in ("COMPLETE", "COMPLETED"):
+                    fill_px = fill_price_map.get(tgt_oid, 0)
+                    await self._log("info", "target_hit_broker",
+                        f"🟢 Target order {tgt_oid} FILLED for {symbol} @ ₹{fill_px:.2f} (broker-native)")
+                    # Cancel the SL order before recording the exit
+                    if sl_oid:
+                        self.broker.cancel_order(sl_oid)
+                        logger.info(f"[❌] Cancelled SL order {sl_oid} after target hit")
+                    pos["sl_order_id"] = ""
+                    pos["target_order_id"] = ""
+                    await self.exit_trade(pos["trade_id"], "TARGET_HIT_BROKER", fill_px)
+                    handled = True
+
+                # ── FALLBACK: Price polling (no order IDs or paper broker) ──
+                if not handled and not sl_oid and not tgt_oid:
+                    price = self.broker.get_fresh_price(symbol)
+                    if not price or price <= 0:
+                        continue
+                    sl = pos["stop_loss"]
+                    tgt = pos["target"]
+                    sig = pos["signal"]
+                    if "BUY" in sig:
+                        if price <= sl:
+                            await self.exit_trade(pos["trade_id"], "SL_HIT", price)
+                        elif price >= tgt:
+                            await self.exit_trade(pos["trade_id"], "TARGET_HIT", price)
+                    else:  # SELL
+                        if price >= sl:
+                            await self.exit_trade(pos["trade_id"], "SL_HIT", price)
+                        elif price <= tgt:
+                            await self.exit_trade(pos["trade_id"], "TARGET_HIT", price)
+
+            except Exception as e:
+                logger.warning(f"SL/Target check error for {symbol}: {e}")
+
+    async def _adjust_bracket_orders(self):
+        """
+        Dynamically modify live SL/Target bracket orders based on market movement.
+        Called every 60s. Implements:
+        - Trailing Stop: moves SL up for profitable BUY trades (locks in gains)
+        - Profit Tightening: reduces target if price retreats significantly
+        """
+        for symbol, pos in list(self.open_trades.items()):
+            try:
+                sl_oid = pos.get("sl_order_id", "")
+                tgt_oid = pos.get("target_order_id", "")
+                if not sl_oid and not tgt_oid:
+                    continue  # no live orders, skip
+
                 price = self.broker.get_fresh_price(symbol)
                 if not price or price <= 0:
                     continue
 
+                entry = pos["entry"]
                 sl = pos["stop_loss"]
                 tgt = pos["target"]
                 sig = pos["signal"]
+                is_buy = "BUY" in sig
 
-                if "BUY" in sig:
-                    if price <= sl:
-                        await self.exit_trade(pos["trade_id"], "SL_HIT", price)
-                    elif price >= tgt:
-                        await self.exit_trade(pos["trade_id"], "TARGET_HIT", price)
-                else:  # SELL
-                    if price >= sl:
-                        await self.exit_trade(pos["trade_id"], "SL_HIT", price)
-                    elif price <= tgt:
-                        await self.exit_trade(pos["trade_id"], "TARGET_HIT", price)
+                trade_range = abs(tgt - entry)  # original risk unit
+                if trade_range <= 0:
+                    continue
+
+                # ── Trailing Stop for BUY trades ──────────────────
+                # Once price moves 50% toward target, trail SL to +10% of entry (breakeven+)
+                if is_buy:
+                    profit_pct = (price - entry) / trade_range  # 0=breakeven, 1=target
+                    if profit_pct >= 0.5:
+                        # Trail SL to 25% of the way between entry and target
+                        new_sl = round(entry + trade_range * 0.25, 2)
+                        if new_sl > sl + 0.5 and sl_oid:  # only move if meaningfully better
+                            result = self.broker.modify_order(sl_oid, trigger_price=new_sl)
+                            if result.get("status") != "FAILED":
+                                pos["stop_loss"] = new_sl
+                                # Persist to DB
+                                db = SessionLocal()
+                                try:
+                                    db.query(Trade).filter(Trade.id == pos["trade_id"]).update({"stop_loss": new_sl})
+                                    db.commit()
+                                finally:
+                                    db.close()
+                                await self._log("info", "trailing_stop",
+                                    f"🛡️⬆️ Trailing SL for {symbol}: ₹{sl:.2f} → ₹{new_sl:.2f} (price ₹{price:.2f})")
+
+                # ── Trailing Stop for SELL trades ──────────────────
+                else:
+                    profit_pct = (entry - price) / trade_range
+                    if profit_pct >= 0.5:
+                        new_sl = round(entry - trade_range * 0.25, 2)
+                        if new_sl < sl - 0.5 and sl_oid:  # only trail down for short
+                            result = self.broker.modify_order(sl_oid, trigger_price=new_sl)
+                            if result.get("status") != "FAILED":
+                                pos["stop_loss"] = new_sl
+                                db = SessionLocal()
+                                try:
+                                    db.query(Trade).filter(Trade.id == pos["trade_id"]).update({"stop_loss": new_sl})
+                                    db.commit()
+                                finally:
+                                    db.close()
+                                await self._log("info", "trailing_stop",
+                                    f"🛡️⬇️ Trailing SL for {symbol}: ₹{sl:.2f} → ₹{new_sl:.2f} (price ₹{price:.2f})")
 
             except Exception as e:
-                logger.warning(f"SL/Target check error for {symbol}: {e}")
+                logger.warning(f"_adjust_bracket_orders error for {symbol}: {e}")
 
     # ─────────────────────────────────────────────────────────
     # Helpers
@@ -621,6 +837,29 @@ class TradingEngine:
                 except Exception as e:
                     logger.warning(f"Floating P&L calc failed for {symbol}: {e}")
 
+            feed_status = {}
+            if hasattr(self.broker, "get_feed_status"):
+                try:
+                    feed_status = self.broker.get_feed_status() or {}
+                except Exception:
+                    feed_status = {}
+
+            connected = feed_status.get("connected")
+            if connected is not None and connected != self._last_feed_connected:
+                self._last_feed_connected = connected
+                if connected:
+                    await self._log(
+                        "info",
+                        "market_feed_restored",
+                        f"📡 Live feed restored via {feed_status.get('source', 'unknown')}"
+                    )
+                else:
+                    await self._log(
+                        "warning",
+                        "market_feed_degraded",
+                        f"⚠️ Live market feed degraded. Fallback source: {feed_status.get('source', 'unknown')}"
+                    )
+
             await _get_ws_manager().send_to_user(self.user_id, {
                 "type": "metrics_update",
                 "data": {
@@ -629,6 +868,7 @@ class TradingEngine:
                     "floating_pnl": round(floating_pnl, 2),
                     "total_pnl": round(realized_pnl + floating_pnl, 2),
                     "open_positions_detail": open_positions_detail,
+                    "feed_status": feed_status,
                     "last_update": self.last_update,
                 },
             })

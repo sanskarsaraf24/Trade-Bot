@@ -59,10 +59,22 @@ def calculate_bollinger(candles: list[dict], period: int = 20) -> dict:
         bb = ta.bbands(df["close"], length=period)
         if bb is None or bb.empty:
             return {"upper": None, "middle": None, "lower": None, "width": None}
+        
+        # Robustly find columns: pandas-ta uses BBU_20_2.0 but sometimes BBU_20
+        col_map = {}
+        for col in bb.columns:
+            if col.startswith(f"BBU_"): col_map["upper"] = col
+            if col.startswith(f"BBM_"): col_map["middle"] = col
+            if col.startswith(f"BBL_"): col_map["lower"] = col
+
+        if "upper" not in col_map or "lower" not in col_map:
+             logger.warning(f"Bollinger columns not found. Detected: {list(bb.columns)}")
+             return {"upper": None, "middle": None, "lower": None, "width": None}
+
         current_price = float(df["close"].iloc[-1])
-        upper = float(bb[f"BBU_{period}_2.0"].iloc[-1])
-        mid = float(bb[f"BBM_{period}_2.0"].iloc[-1])
-        lower = float(bb[f"BBL_{period}_2.0"].iloc[-1])
+        upper = float(bb[col_map["upper"]].iloc[-1])
+        mid = float(bb[col_map["middle"]].iloc[-1])
+        lower = float(bb[col_map["lower"]].iloc[-1])
         return {
             "upper": round(upper, 2),
             "middle": round(mid, 2),
@@ -123,6 +135,33 @@ def calculate_all_indicators(candles: list[dict]) -> dict:
         "atr": calculate_atr(candles),
         "volume_trend": calculate_volume_trend(candles),
     }
+
+
+def build_macro_narrative(metadata: dict, current_price: float) -> str:
+    """Build a summary of the macro context (52w, 7d trend)."""
+    if not metadata:
+        return "Macro context unavailable."
+    
+    h52 = metadata.get("52w_high", 0)
+    l52 = metadata.get("52w_low", 0)
+    change_7d = metadata.get("7d_change_pct", 0)
+    
+    dist_high = ((h52 - current_price) / current_price * 100) if current_price else 0
+    dist_low = ((current_price - l52) / l52 * 100) if l52 else 0
+    
+    parts = []
+    if dist_high < 5:
+        parts.append(f"Near 52-week HIGH (only {dist_high:.1f}% away)")
+    elif dist_low < 5:
+        parts.append(f"Near 52-week LOW (only {dist_low:.1f}% away)")
+    else:
+        # Position in range
+        pos = (current_price - l52) / (h52 - l52) * 100 if (h52 - l52) else 50
+        parts.append(f"Position in 52-week range: {pos:.0f}%")
+        
+    parts.append(f"7-day trend: {'Up' if change_7d > 0 else 'Down'} {abs(change_7d):.1f}%")
+    
+    return ". ".join(parts) + "."
 
 
 def build_narrative(symbol: str, price: float, indicators: dict) -> str:

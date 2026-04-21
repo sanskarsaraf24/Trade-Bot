@@ -46,22 +46,40 @@ class RiskManager:
     # ─── Position sizing ─────────────────────────────────────
     def calculate_position_size(self, entry_price: float, stop_loss: float) -> int:
         """
-        1% risk rule: risk only (risk_per_trade_percent)% of capital per trade.
-        Qty = (capital × risk%) / |entry - SL|
+        Calculates quantity based on TWO limits:
+        1. Risk Limit: Qty = (Capital × Risk%) / |Entry - SL|
+        2. Margin Limit: Qty = (Available Balance × Leverage) / Entry Price
         """
-        capital = self.config.account_balance
-        margin = getattr(self.config, "margin_multiplier", 1.0) or 1.0
-        risk_amount = (capital * margin) * (self.config.risk_per_trade_percent / 100)
+        # 1. Risk-based quantity (Capital × 1% risk rule)
+        base_capital = self.config.account_balance
+        risk_pct = self.config.risk_per_trade_percent / 100
+        risk_amount = base_capital * risk_pct
+        
         price_risk = abs(entry_price - stop_loss)
-
         if price_risk <= 0:
-            logger.warning("SL == entry price; defaulting to qty=1")
             return 1
+            
+        qty_by_risk = int(risk_amount / price_risk)
 
-        qty = int(risk_amount / price_risk)
-        return max(1, qty)
+        # 2. Margin-based quantity (Available Funds × 5x Leverage)
+        # We use the real-time available balance from Zerodha
+        leverage = getattr(self.config, "margin_multiplier", 5.0) or 5.0
+        max_buying_power = self._available_balance * leverage
+        
+        qty_by_margin = int(max_buying_power / entry_price)
+
+        # Final quantity is the more conservative of the two
+        final_qty = min(qty_by_risk, qty_by_margin)
+        
+        logger.info(f"Position Sizing: RiskQty={qty_by_risk}, MarginQty={qty_by_margin} (Balance: {self._available_balance}, Lev: {leverage}) -> Final: {final_qty}")
+        
+        return max(1, final_qty)
 
     # ─── State updates (called by trading engine) ─────────────
+    def update_available_balance(self, balance: float):
+        """Update the real-time balance fetched from broker."""
+        self._available_balance = balance
+
     def update_daily_pnl(self, pnl: float):
         self._daily_pnl = pnl
 

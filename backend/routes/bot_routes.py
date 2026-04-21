@@ -1,12 +1,11 @@
 import asyncio
 import logging
-from datetime import datetime
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from database.session import get_db
-from database.models import BotSession, BotStatus, TradingConfiguration, User
+from database.models import BotSession, BotStatus, TradingConfiguration, User, ist_now
 from routes.auth import get_current_user
 from services.trading_engine import TradingEngine
 
@@ -92,7 +91,7 @@ async def _run_engine(engine: TradingEngine, user_id: str, session_id: str):
             db.query(BotSession).filter(
                 BotSession.id == session_id,
                 BotSession.status.in_([BotStatus.running, BotStatus.paused]),
-            ).update({"status": BotStatus.stopped, "stopped_at": datetime.utcnow()})
+            ).update({"status": BotStatus.stopped, "stopped_at": ist_now()})
             db.commit()
         finally:
             db.close()
@@ -137,21 +136,41 @@ async def stop_bot(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    engine = _get_engine(current_user.id)
-    closed = await engine.close_all_positions()
-    engine.stop()
-    _active_engines.pop(current_user.id, None)
+    """Stop the trading bot. Closes positions and removes from active registry."""
+    engine = _active_engines.get(current_user.id)
+    closed_count = 0
+    
+    if engine:
+        try:
+            closed = await engine.close_all_positions()
+            closed_count = len(closed)
+            engine.stop()
+        except Exception as e:
+            logger.error(f"Error during engine shutdown for {current_user.email}: {e}")
+        finally:
+            _active_engines.pop(current_user.id, None)
 
-    db.query(BotSession).filter(
+    # Database cleanup: update ANY running or paused session for this user to 'stopped'
+    updated_count = db.query(BotSession).filter(
         BotSession.user_id == current_user.id,
         BotSession.status.in_([BotStatus.running, BotStatus.paused]),
-    ).update({"status": BotStatus.stopped, "stopped_at": datetime.utcnow()})
+    ).update({
+        "status": BotStatus.stopped, 
+        "stopped_at": ist_now()
+    })
     db.commit()
+
+    if not engine and updated_count == 0:
+        raise HTTPException(status_code=404, detail="Bot is not running")
+
+    message = f"Bot stopped. {closed_count} position(s) closed."
+    if not engine and updated_count > 0:
+        message = "Stale bot session cleaned up (engine was already closed or offline)."
 
     return {
         "success": True,
-        "positions_closed": len(closed),
-        "message": f"Bot stopped. {len(closed)} position(s) closed.",
+        "positions_closed": closed_count,
+        "message": message,
     }
 
 
@@ -181,7 +200,7 @@ async def bot_status(
 
     uptime = None
     if session.started_at and not session.stopped_at:
-        uptime = int((datetime.utcnow() - session.started_at).total_seconds())
+        uptime = int((ist_now() - session.started_at).total_seconds())
 
     return {
         "session_id": session.id,

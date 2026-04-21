@@ -58,7 +58,11 @@ export const tradesApi = {
   exitOne: (tradeId: string) => api.post(`/trades/exit/${tradeId}`),
   exitAll: () => api.post('/trades/exit-all'),
   floatingPnl: () => api.get('/trades/floating-pnl'),
-  updateTrade: (tradeId: string, data: { stop_loss?: number, target?: number }) => api.post(`/trades/update/${tradeId}`, data),
+  updateTrade: (tradeId: string, data: { stop_loss?: number, target?: number }) =>
+    api.post(`/trades/update/${tradeId}`, data),
+  // Modifies LIVE bracket orders on the exchange (SL-M + LIMIT target)
+  modifyBracket: (tradeId: string, data: { stop_loss?: number, target?: number }) =>
+    api.patch(`/trades/bracket/${tradeId}`, data),
 }
 
 export const metricsApi = {

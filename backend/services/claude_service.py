@@ -23,12 +23,12 @@ class ClaudeService:
         # Use the latest efficient model
         self.model = "claude-haiku-4-5"
 
-    def get_signals(self, features: dict, config) -> list[dict]:
+    def get_signals(self, features: dict, config, open_positions: int = 0) -> list[dict]:
         """
         Analyze market features and return structured trade signals.
         Returns list of signal dicts.
         """
-        prompt = self._build_prompt(features, config)
+        prompt = self._build_prompt(features, config, open_positions=open_positions)
 
         try:
             message = self.client.messages.create(
@@ -58,25 +58,26 @@ class ClaudeService:
             logger.error(f"Claude service error: {e}")
             return []
 
-    def _build_prompt(self, features: dict, config) -> str:
+    def _build_prompt(self, features: dict, config, open_positions: int = 0) -> str:
         symbols_block = ""
         for symbol, feat in features.items():
             symbols_block += f"\n### {symbol}\n"
             symbols_block += f"Current Price: ₹{feat['current_price']:.2f}\n"
-            symbols_block += f"Analysis: {feat['narrative']}\n"
+            
+            # --- Macro Context ---
+            macro = feat.get("macro_context", {})
+            if macro:
+                symbols_block += f"Macro: {feat.get('macro_narrative')}\n"
+                symbols_block += f"52w High/Low: {macro.get('52w_high')}/{macro.get('52w_low')}\n"
+                symbols_block += f"7d Avg Volume: {macro.get('7d_avg_volume'):,.0f}\n"
+
+            symbols_block += f"5m Analysis: {feat['narrative']}\n"
             ind = feat.get("indicators", {})
             rsi = ind.get("rsi")
             macd = ind.get("macd", {})
             bb = ind.get("bollinger", {})
-            sma20 = ind.get("sma_20")
-            sma50 = ind.get("sma_50")
-            atr = ind.get("atr")
-            symbols_block += f"RSI(14): {rsi}\n"
-            symbols_block += f"MACD Hist: {macd.get('histogram')}\n"
-            symbols_block += f"BB Position: {bb.get('price_position')}%\n"
-            symbols_block += f"SMA20/50: {sma20}/{sma50}\n"
-            symbols_block += f"ATR(14): {atr}\n"
-            symbols_block += f"Volume: {ind.get('volume_trend')}\n"
+            symbols_block += f"RSI(14): {rsi} | MACD Hist: {macd.get('histogram')} | BB Position: {bb.get('price_position')}%\n"
+            symbols_block += f"ATR(14): {ind.get('atr')}\n"
 
         risk_amt = config.account_balance * config.risk_per_trade_percent / 100
         strategies = ", ".join(config.enabled_strategies) if config.enabled_strategies else "all strategies"
@@ -88,29 +89,30 @@ class ClaudeService:
 SYSTEM INSTRUCTIONS: {instructions}
 
 ACCOUNT:
-- Balance: ₹{config.account_balance:,.0f}
+- Available Budget: ₹{config.account_balance:,.0f}
 - Risk Per Trade: ₹{risk_amt:,.0f} ({config.risk_per_trade_percent}%)
 - Min Confidence: {config.min_confidence_threshold}%
-- Timeframe: {config.timeframe}
-- Strategy Focus: {strategies}
-- Avoid: {avoid}
+- Timeframe: {config.timeframe} (with Daily Macro Context)
+- Open Positions: {open_positions}/{config.max_concurrent_positions}
 
 SYMBOLS:
 {symbols_block}
 
-RULES:
-1. Only recommend if confidence >= {config.min_confidence_threshold}%
-2. Stop-loss MUST be meaningful (not too tight or wide) — use ATR as guide
-3. Risk:Reward must be minimum 1:1.5
-4. Include HOLD for symbols where no clear setup exists
-5. Return ONLY valid JSON, no markdown, no commentary
+CRITICAL RULES:
+1. TRADING AGAINST THE MACRO TREND: Be very cautious buying if the 7-day trend is down, or selling if the 7-day trend is up.
+2. 52-WEEK LEVELS: Expect support at the 52-week low and resistance at the 52-week high.
+3. LOGICAL REASONING (CoT): For each symbol, first consider the pros and cons of taking a trade.
+4. Risk:Reward must be minimum 1:1.5. Target and SL must be ATR-realistic.
+5. Minimum Confidence: {config.min_confidence_threshold}%
+6. JSON ONLY: Return ONLY valid JSON.
 
-JSON FORMAT (include ALL analyzed symbols):
+JSON FORMAT:
 {{
   "SYMBOL": {{
-    "signal": "BUY_STOCK | SELL_STOCK | BUY_CALL | BUY_PUT | HOLD",
+    "signal": "BUY_STOCK | SELL_STOCK | HOLD",
     "confidence": 0-100,
-    "reasoning": "Concise technical reason (max 80 words)",
+    "thought_process": "Write 2-3 sentences analyzing the 15m/Macro trend vs 5m indicators",
+    "reasoning": "Final technical trigger summary",
     "entry_level": <number>,
     "stop_loss": <number>,
     "target": <number>,
