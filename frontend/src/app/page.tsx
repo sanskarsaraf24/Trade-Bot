@@ -60,7 +60,7 @@ export default function Dashboard() {
     if (!token) { router.push('/login'); return }
     refreshAll()
     const interval = setInterval(refreshAll, 20_000)
-    // Poll REST floating P&L every 15s as fallback when WS isn't streaming
+    // Poll REST floating P&L every 5s as guaranteed fallback regardless of WS state
     const floatInterval = setInterval(async () => {
       try {
         const { data } = await tradesApi.floatingPnl()
@@ -68,7 +68,7 @@ export default function Dashboard() {
         ;(data?.positions || []).forEach((p: any) => { map[p.symbol] = { current_price: p.current_price, floating_pnl: p.floating_pnl } })
         setFloatingPositions(map)
       } catch {}
-    }, 15_000)
+    }, 5_000)
     return () => { clearInterval(interval); clearInterval(floatInterval) }
   }, [token, router, refreshAll])
 

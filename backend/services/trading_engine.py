@@ -308,6 +308,26 @@ class TradingEngine:
             return
 
         max_qty = self.risk_manager.calculate_position_size(entry, sl)
+
+        # ── Live margin check: cap qty to what Zerodha can actually fill ──
+        # Use the real broker balance (not the stale config value)
+        try:
+            live_balance = self.broker.get_account_balance()
+            if live_balance > 0:
+                # MIS margin is typically 20-40% of trade value; use conservative 50% buffer
+                # available_for_trade = live_balance * margin_multiplier (e.g. 5x leverage = 5x buying power)
+                margin_mult = getattr(self.config, 'margin_multiplier', 1.0) or 1.0
+                # Allow using up to 90% of available margin to leave headroom
+                max_trade_value = live_balance * margin_mult * 0.90
+                max_qty_by_balance = max(1, int(max_trade_value / entry)) if entry > 0 else max_qty
+                if max_qty_by_balance < max_qty:
+                    logger.info(
+                        f"[MARGIN] Capping qty {max_qty}→{max_qty_by_balance} for {symbol} "
+                        f"(live balance=₹{live_balance:.0f}, max trade value=₹{max_trade_value:.0f})"
+                    )
+                    max_qty = max_qty_by_balance
+        except Exception as e:
+            logger.warning(f"[MARGIN] Could not fetch live balance for {symbol}: {e}")
         ai_qty = signal.get("suggested_quantity")
         if ai_qty and isinstance(ai_qty, (int, float)) and ai_qty > 0:
             qty = min(int(ai_qty), max_qty)

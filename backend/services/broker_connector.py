@@ -9,6 +9,7 @@ import random
 from abc import ABC, abstractmethod
 from datetime import date, datetime, timedelta
 from typing import Dict, List, Optional
+from config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -144,7 +145,7 @@ class PaperBroker(BaseBroker):
         return round(seed * (1 + random.uniform(-0.003, 0.003)), 2)
 
     def get_fresh_price(self, symbol: str) -> float:
-        """Bypass all caching — always call the source (live_broker REST or Yahoo)."""
+        """Bypass all caching. Always calls Zerodha REST if available — NEVER Yahoo."""
         if self.live_broker:
             try:
                 live = self.live_broker.get_fresh_price(symbol)
@@ -750,29 +751,38 @@ def create_broker(
     totp_secret: str = "",
     balance: float = 1_000_000,
 ) -> BaseBroker:
-    if broker_type == "zerodha" and api_key:
+    settings = get_settings()
+    # Always fall back to system-wide env-var credentials if user hasn't set their own
+    final_api_key    = api_key    or settings.zerodha_api_key
+    final_api_secret = api_secret or settings.zerodha_api_secret
+    final_totp       = totp_secret or settings.zerodha_totp_secret
+
+    if broker_type == "zerodha" and final_api_key:
+        src = "user-specific" if api_key else "global system env"
+        logger.info(f"[BROKER] Creating ZerodhaBroker using {src} credentials")
         return ZerodhaBroker(
-            api_key=api_key,
-            api_secret=api_secret,
+            api_key=final_api_key,
+            api_secret=final_api_secret,
             access_token=access_token or None,
-            totp_secret=totp_secret or None,
+            totp_secret=final_totp or None,
         )
-        
+
     live_ref = None
     if api_key and (access_token or totp_secret):
         try:
-            logger.info("Initializing background ZerodhaBroker for precise Paper ticker prices...")
+            logger.info("[BROKER] Initializing background ZerodhaBroker for Paper LTP prices...")
             live_ref = ZerodhaBroker(
-                api_key=api_key,
-                api_secret=api_secret,
+                api_key=final_api_key,
+                api_secret=final_api_secret,
                 access_token=access_token or None,
-                totp_secret=totp_secret or None,
+                totp_secret=final_totp or None,
             )
             if not live_ref.is_token_valid():
                 logger.warning("Background Zerodha token invalid; paper mode will use Yahoo/seed fallback.")
                 live_ref = None
         except Exception as e:
-            logger.warning(f"Could not init background Zerodha: {e}")
+            logger.warning(f"[BROKER] Background Zerodha init failed: {e}")
+            live_ref = None
 
-    logger.info("Using Paper Broker (simulation mode)")
+    logger.info("[BROKER] Using Paper Broker (simulation mode)")
     return PaperBroker(starting_balance=balance, live_broker=live_ref)
