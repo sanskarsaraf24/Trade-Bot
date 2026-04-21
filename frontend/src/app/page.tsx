@@ -60,7 +60,7 @@ export default function Dashboard() {
     if (!token) { router.push('/login'); return }
     refreshAll()
     const interval = setInterval(refreshAll, 20_000)
-    // Poll REST floating P&L every 15s as fallback when WS isn't streaming
+    // Poll REST floating P&L every 5s as guaranteed fallback regardless of WS state
     const floatInterval = setInterval(async () => {
       try {
         const { data } = await tradesApi.floatingPnl()
@@ -70,7 +70,7 @@ export default function Dashboard() {
           setFloatingPositions(map)
         }
       } catch {}
-    }, 15_000)
+    }, 5_000)
     return () => { clearInterval(interval); clearInterval(floatInterval) }
   }, [token, router, refreshAll])
 
@@ -92,13 +92,19 @@ export default function Dashboard() {
         dailyPnl: data.daily_pnl as number,
         lastUpdate: data.last_update as string,
       })
-      // Capture live prices + floating P&L from engine's WS broadcast
-      if (data.open_positions_detail) {
-        const map: Record<string, {current_price: number, floating_pnl: number}> = {}
-        ;(data.open_positions_detail as any[]).forEach((p) => {
-          map[p.symbol] = { current_price: p.current_price, floating_pnl: p.floating_pnl }
+      // Only update floatingPositions if we received actual position data
+      // NEVER clear existing live prices with an empty array — that causes the freeze
+      const details = (data.open_positions_detail as any[]) || []
+      if (details.length > 0) {
+        setFloatingPositions((prev) => {
+          const next = { ...prev }
+          details.forEach((p) => {
+            if (p.current_price > 0) {
+              next[p.symbol] = { current_price: p.current_price, floating_pnl: p.floating_pnl }
+            }
+          })
+          return next
         })
-        setFloatingPositions(map)
       }
       metricsApi.daily().then((r) => setDailyMetrics(r.data))
     },
