@@ -50,7 +50,7 @@ class RiskManager:
         Qty = (capital × risk%) / |entry - SL|
         """
         capital = self.config.account_balance
-        margin = getattr(self.config, "margin_multiplier", 1.0) or 1.0
+        margin = getattr(self.config, "margin_multiplier", 5.0) or 5.0
         risk_amount = (capital * margin) * (self.config.risk_per_trade_percent / 100)
         price_risk = abs(entry_price - stop_loss)
 

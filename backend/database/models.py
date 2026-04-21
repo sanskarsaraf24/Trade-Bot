@@ -107,7 +107,7 @@ class TradingConfiguration(Base):
     analysis_interval_minutes = Column(Integer, default=15)
 
     # Margin & Profit Constraints
-    margin_multiplier = Column(Float, default=1.0)
+    margin_multiplier = Column(Float, default=5.0)
     min_profit_absolute = Column(Float, nullable=True)
     min_profit_percent = Column(Float, nullable=True)
     default_stop_loss_percent = Column(Float, default=0.5)
